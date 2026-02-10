@@ -376,9 +376,9 @@ class Machine:
                         loc, keys = slot[1], slot[2]
                         ref = [self.value_trace[key] for key in keys]
                         res = core.scratch[loc : loc + VLEN]
-                        assert res == ref, (
-                            f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
-                        )
+                        assert (
+                            res == ref
+                        ), f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
                 continue
             assert len(slots) <= SLOT_LIMITS[name]
             for i, slot in enumerate(slots):
@@ -459,7 +459,12 @@ def myhash(a: int) -> int:
         return x % (2**32)
 
     for op1, val1, op2, op3, val3 in HASH_STAGES:
-        a = r(fns[op2](r(fns[op1](a, val1)), r(fns[op3](a, val3))))
+        a = r(
+            fns[op2](
+                r(fns[op1](a, val1)),
+                r(fns[op3](a, val3)),
+            ),
+        )
 
     return a
 

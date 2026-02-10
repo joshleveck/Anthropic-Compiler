@@ -1,0 +1,16 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "perf takehome test debug",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "perf_takehome.py",
+      "console": "integratedTerminal",
+      "args": "Tests.test_kernel_trace"
+    }
+  ]
+}
