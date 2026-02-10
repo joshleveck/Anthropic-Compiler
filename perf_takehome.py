@@ -94,8 +94,8 @@ class KernelBuilder:
             addr = self.alloc_scratch(name, VLEN)
             const_addr = self.scratch_const(val)
             self.add("valu", ("vbroadcast", addr, const_addr))
-            self.const_map[val] = addr
-        return self.const_map[val]
+            self.vconst_map[val] = addr
+        return self.vconst_map[val]
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
@@ -119,18 +119,18 @@ class KernelBuilder:
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            val1_const = self.scratch_const(val1)
-            val3_const = self.scratch_const(val3)
+            # val1_const = self.scratch_const(val1)
+            # val3_const = self.scratch_const(val3)
+            # slots.append(
+            #     [
+            #         ("valu", ("vbroadcast", vconst1, val1_const)),
+            #         ("valu", ("vbroadcast", vconst2, val3_const)),
+            #     ]
+            # )
             slots.append(
                 [
-                    ("valu", ("vbroadcast", vconst1, val1_const)),
-                    ("valu", ("vbroadcast", vconst2, val3_const)),
-                ]
-            )
-            slots.append(
-                [
-                    ("valu", (op1, vtmp1, val_hash_addr, vconst1)),
-                    ("valu", (op3, vtmp2, val_hash_addr, vconst2)),
+                    ("valu", (op1, vtmp1, val_hash_addr, self.vscratch_const(val1))),
+                    ("valu", (op3, vtmp2, val_hash_addr, self.vscratch_const(val3))),
                 ]
             )
 
@@ -277,9 +277,15 @@ class KernelBuilder:
                         ("+", vtmp_addr3, self.scratch["vforest_values_p"], vtmp_idx),
                     )
                 )
-                for li in range(VLEN):
+                for li in range(0, VLEN, 2):
                     body.append(
-                        ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li))
+                        [
+                            ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li)),
+                            (
+                                "load",
+                                ("load_offset", vtmp_node_val, vtmp_addr3, li + 1),
+                            ),
+                        ]
                     )
                     body.append(
                         (
@@ -288,6 +294,16 @@ class KernelBuilder:
                                 "compare",
                                 vtmp_node_val + li,
                                 (round, batch + li, "node_val"),
+                            ),
+                        )
+                    )
+                    body.append(
+                        (
+                            "debug",
+                            (
+                                "compare",
+                                vtmp_node_val + li + 1,
+                                (round, batch + li + 1, "node_val"),
                             ),
                         )
                     )
@@ -310,16 +326,36 @@ class KernelBuilder:
                 # new and improved idx calculation
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("valu", ("%", vtmp1, vtmp_val, vtwo_const)))
+                # so actually its
+                # idx*2 + ((val % 2) + 1)
+                # or
+                # (2*idx + 1) + val % 2
                 body.append(
                     [
-                        ("valu", ("*", vtmp_idx, vtmp_idx, vtwo_const)),
-                        ("valu", ("+", vtmp1, vtmp1, vone_const)),
+                        ("valu", ("%", vtmp1, vtmp_val, vtwo_const)),
+                        (
+                            "valu",
+                            (
+                                "multiply_add",
+                                vtmp_idx,
+                                vtmp_idx,
+                                vtwo_const,
+                                vone_const,
+                            ),
+                        ),
                     ]
                 )
-                body.append(
-                    ("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)),
-                )
+                body.append(("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)))
+                # body.append(("valu", ("%", vtmp1, vtmp_val, vtwo_const)))
+                # body.append(
+                #     [
+                #         ("valu", ("*", vtmp_idx, vtmp_idx, vtwo_const)),
+                #         ("valu", ("+", vtmp1, vtmp1, vone_const)),
+                #     ]
+                # )
+                # body.append(
+                #     ("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)),
+                # )
                 body.append(
                     (
                         "debug",
