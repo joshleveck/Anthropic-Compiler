@@ -115,6 +115,39 @@ class KernelBuilder:
 
         return slots
 
+    def vbuild_hash(self, val_hash_addr, vtmp1, vtmp2, round, batch, vconst1, vconst2):
+        slots = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            val1_const = self.scratch_const(val1)
+            val3_const = self.scratch_const(val3)
+            slots.append(
+                [
+                    ("valu", ("vbroadcast", vconst1, val1_const)),
+                    ("valu", ("vbroadcast", vconst2, val3_const)),
+                ]
+            )
+            slots.append(
+                [
+                    ("valu", (op1, vtmp1, val_hash_addr, vconst1)),
+                    ("valu", (op3, vtmp2, val_hash_addr, vconst2)),
+                ]
+            )
+
+            slots.append(("valu", (op2, val_hash_addr, vtmp1, vtmp2)))
+            slots.append(
+                (
+                    "debug",
+                    (
+                        "vcompare",
+                        val_hash_addr,
+                        [(round, batch + vi, "hash_stage", hi) for vi in range(VLEN)],
+                    ),
+                )
+            )
+
+        return slots
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -124,8 +157,9 @@ class KernelBuilder:
         """
         tmp1 = self.alloc_scratch("tmp1")
         vtmp1 = self.alloc_scratch("vtmp1", VLEN)
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
+        vtmp2 = self.alloc_scratch("vtmp2", VLEN)
+        vtmp3 = self.alloc_scratch("vtmp3", VLEN)
+        vtmp4 = self.alloc_scratch("vtmp4", VLEN)
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -142,11 +176,8 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
         vzero_const = self.vscratch_const(0)
-        one_const = self.scratch_const(1)
         vone_const = self.vscratch_const(1)
-        two_const = self.scratch_const(2)
         vtwo_const = self.vscratch_const(2)
 
         self.alloc_scratch("vforest_values_p", VLEN)
@@ -180,9 +211,9 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Scalar scratch registers
-        vtmp_idx = self.alloc_scratch("tmp_idx", VLEN)
-        vtmp_val = self.alloc_scratch("tmp_val", VLEN)
-        vtmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
+        vtmp_idx = self.alloc_scratch("vtmp_idx", VLEN)
+        vtmp_val = self.alloc_scratch("vtmp_val", VLEN)
+        vtmp_node_val = self.alloc_scratch("vtmp_node_val", VLEN)
         tmp_addr1 = self.alloc_scratch("tmp_addr1")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
         vtmp_addr3 = self.alloc_scratch("vtmp_addr3", VLEN)
@@ -262,13 +293,9 @@ class KernelBuilder:
                     )
 
                 body.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
-                for vi in range(VLEN):
-                    i = batch + vi
-                    tmp_idx = vtmp_idx + vi
-                    tmp_val = vtmp_val + vi
-                    tmp_node_val = vtmp_node_val + vi
-                    # val = myhash(val ^ node_val)
-                    body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+                body.extend(
+                    self.vbuild_hash(vtmp_val, vtmp1, vtmp2, round, batch, vtmp3, vtmp4)
+                )
                 body.append(
                     (
                         "debug",
