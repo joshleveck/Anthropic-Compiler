@@ -119,14 +119,6 @@ class KernelBuilder:
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # val1_const = self.scratch_const(val1)
-            # val3_const = self.scratch_const(val3)
-            # slots.append(
-            #     [
-            #         ("valu", ("vbroadcast", vconst1, val1_const)),
-            #         ("valu", ("vbroadcast", vconst2, val3_const)),
-            #     ]
-            # )
             slots.append(
                 [
                     ("valu", (op1, vtmp1, val_hash_addr, self.vscratch_const(val1))),
@@ -346,16 +338,6 @@ class KernelBuilder:
                     ]
                 )
                 body.append(("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)))
-                # body.append(("valu", ("%", vtmp1, vtmp_val, vtwo_const)))
-                # body.append(
-                #     [
-                #         ("valu", ("*", vtmp_idx, vtmp_idx, vtwo_const)),
-                #         ("valu", ("+", vtmp1, vtmp1, vone_const)),
-                #     ]
-                # )
-                # body.append(
-                #     ("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)),
-                # )
                 body.append(
                     (
                         "debug",
