@@ -115,7 +115,7 @@ class KernelBuilder:
 
         return slots
 
-    def vbuild_hash(self, val_hash_addr, vtmp1, vtmp2, round, batch, vconst1, vconst2):
+    def vbuild_hash(self, val_hash_addr, vtmp1, vtmp2, round, batch):
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -127,18 +127,123 @@ class KernelBuilder:
             )
 
             slots.append(("valu", (op2, val_hash_addr, vtmp1, vtmp2)))
-            slots.append(
-                (
-                    "debug",
-                    (
-                        "vcompare",
-                        val_hash_addr,
-                        [(round, batch + vi, "hash_stage", hi) for vi in range(VLEN)],
-                    ),
-                )
-            )
+
+        assert len(slots) <= 12
 
         return slots
+
+    def stage_1(
+        self, batch, s1_addr1, s1_addr2, s1_vaddr3, s1_idx, s1_val, s1_node_val
+    ):
+        body = []
+
+        i_const = self.scratch_const(batch)
+        # addr sums
+        body.append(
+            [
+                (
+                    "alu",
+                    (
+                        "+",
+                        s1_addr1,
+                        self.scratch["inp_indices_p"],
+                        i_const,
+                    ),
+                ),
+                (
+                    "alu",
+                    ("+", s1_addr2, self.scratch["inp_values_p"], i_const),
+                ),
+            ]
+        )
+
+        # idx = mem[inp_indices_p + i]
+        # val = mem[inp_values_p + i]
+        body.append(
+            [
+                ("load", ("vload", s1_idx, s1_addr1)),
+                ("load", ("vload", s1_val, s1_addr2)),
+            ]
+        )
+        # node_val = mem[forest_values_p + idx]
+        body.append(
+            [
+                (
+                    "valu",
+                    ("+", s1_vaddr3, self.scratch["vforest_values_p"], s1_idx),
+                ),
+            ]
+        )
+        for li in range(0, VLEN, 2):
+            body.append(
+                [
+                    ("load", ("load_offset", s1_node_val, s1_vaddr3, li)),
+                    (
+                        "load",
+                        ("load_offset", s1_node_val, s1_vaddr3, li + 1),
+                    ),
+                ]
+            )
+
+        body.append(("valu", ("^", s1_val, s1_val, s1_node_val)))
+
+        assert len(body) <= 12
+
+        return body
+
+    def stage_3(
+        self,
+        s3_addr1,
+        s3_addr2,
+        s3_vtmp1,
+        s3_idx,
+        s3_val,
+        vzero_const,
+        vone_const,
+        vtwo_const,
+    ):
+        body = []
+        # new and improved idx calculation
+
+        # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        # so actually its
+        # idx*2 + ((val % 2) + 1)
+        # or
+        # (2*idx + 1) + val % 2
+        body.append(
+            [
+                ("valu", ("%", s3_vtmp1, s3_val, vtwo_const)),
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        s3_idx,
+                        s3_idx,
+                        vtwo_const,
+                        vone_const,
+                    ),
+                ),
+            ]
+        )
+        body.append(("valu", ("+", s3_idx, s3_idx, s3_vtmp1)))
+
+        # idx = 0 if idx >= n_nodes else idx
+        body.append(("valu", ("<", s3_vtmp1, s3_idx, self.scratch["vn_nodes"])))
+        body.append(("flow", ("vselect", s3_idx, s3_vtmp1, s3_idx, vzero_const)))
+
+        # we alr have the addresses lets go
+        # mem[inp_indices_p + i] = idx
+        # mem[inp_values_p + i] = val
+        body.append(
+            [
+                ("store", ("vstore", s3_addr1, s3_idx)),
+                ("store", ("vstore", s3_addr2, s3_val)),
+            ]
+        )
+
+        assert len(body) <= 12
+
+        return body
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -148,10 +253,10 @@ class KernelBuilder:
         Scalar implementation using only scalar ALU and load/store.
         """
         tmp1 = self.alloc_scratch("tmp1")
-        vtmp1 = self.alloc_scratch("vtmp1", VLEN)
-        vtmp2 = self.alloc_scratch("vtmp2", VLEN)
-        vtmp3 = self.alloc_scratch("vtmp3", VLEN)
-        vtmp4 = self.alloc_scratch("vtmp4", VLEN)
+        # vtmp1 = self.alloc_scratch("vtmp1", VLEN)
+        # vtmp2 = self.alloc_scratch("vtmp2", VLEN)
+        # vtmp3 = self.alloc_scratch("vtmp3", VLEN)
+        # vtmp4 = self.alloc_scratch("vtmp4", VLEN)
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -202,176 +307,106 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        vtmp_idx = self.alloc_scratch("vtmp_idx", VLEN)
-        vtmp_val = self.alloc_scratch("vtmp_val", VLEN)
-        vtmp_node_val = self.alloc_scratch("vtmp_node_val", VLEN)
-        tmp_addr1 = self.alloc_scratch("tmp_addr1")
-        tmp_addr2 = self.alloc_scratch("tmp_addr2")
-        vtmp_addr3 = self.alloc_scratch("vtmp_addr3", VLEN)
+        # Stage 1 Vars
+        s1_addr1 = self.alloc_scratch("s1_addr1")
+        s1_addr2 = self.alloc_scratch("s1_addr2")
+        s1_vaddr3 = self.alloc_scratch("s1_vaddr3", VLEN)
+        s1_idx = self.alloc_scratch("s1_idx", VLEN)
+        s1_val = self.alloc_scratch("s1_val", VLEN)
+        s1_node_val = self.alloc_scratch("s1_node_val", VLEN)
+
+        # Stage 2 Vars
+        s2_addr1 = self.alloc_scratch("s2_addr1")
+        s2_addr2 = self.alloc_scratch("s2_addr2")
+        s2_idx = self.alloc_scratch("s2_idx", VLEN)
+        s2_val = self.alloc_scratch("s2_val", VLEN)
+        s2_vtmp1 = self.alloc_scratch("s2_vtmp1", VLEN)
+        s2_vtmp2 = self.alloc_scratch("s2_vtmp2", VLEN)
+
+        # Stage 3 Vars
+        s3_addr1 = self.alloc_scratch("s3_addr1")
+        s3_addr2 = self.alloc_scratch("s3_addr2")
+        s3_idx = self.alloc_scratch("s3_idx", VLEN)
+        s3_val = self.alloc_scratch("s3_val", VLEN)
+        s3_vtmp1 = self.alloc_scratch("s3_vtmp1", VLEN)
 
         for round in range(rounds):
             for batch in range(0, batch_size, VLEN):
 
-                i_const = self.scratch_const(batch)
-                # addr sums
-                body.append(
-                    [
-                        (
-                            "alu",
-                            (
-                                "+",
-                                tmp_addr1,
-                                self.scratch["inp_indices_p"],
-                                i_const,
-                            ),
-                        ),
-                        (
-                            "alu",
-                            ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
-                        ),
-                    ]
-                )
-
-                # idx = mem[inp_indices_p + i]
-                # val = mem[inp_values_p + i]
-                body.append(
-                    [
-                        ("load", ("vload", vtmp_idx, tmp_addr1)),
-                        ("load", ("vload", vtmp_val, tmp_addr2)),
-                    ]
-                )
-
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_idx,
-                            [(round, batch + vi, "idx") for vi in range(VLEN)],
-                        ),
-                    )
-                )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_val,
-                            [(round, batch + vi, "val") for vi in range(VLEN)],
-                        ),
-                    )
-                )
-                # node_val = mem[forest_values_p + idx]
-                body.append(
-                    (
-                        "valu",
-                        ("+", vtmp_addr3, self.scratch["vforest_values_p"], vtmp_idx),
-                    )
-                )
-                for li in range(0, VLEN, 2):
-                    body.append(
-                        [
-                            ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li)),
-                            (
-                                "load",
-                                ("load_offset", vtmp_node_val, vtmp_addr3, li + 1),
-                            ),
-                        ]
-                    )
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "compare",
-                                vtmp_node_val + li,
-                                (round, batch + li, "node_val"),
-                            ),
-                        )
-                    )
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "compare",
-                                vtmp_node_val + li + 1,
-                                (round, batch + li + 1, "node_val"),
-                            ),
-                        )
-                    )
-
-                body.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
                 body.extend(
-                    self.vbuild_hash(vtmp_val, vtmp1, vtmp2, round, batch, vtmp3, vtmp4)
-                )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_val,
-                            [(round, batch + vi, "hashed_val") for vi in range(VLEN)],
-                        ),
+                    self.stage_1(
+                        batch,
+                        s1_addr1,
+                        s1_addr2,
+                        s1_vaddr3,
+                        s1_idx,
+                        s1_val,
+                        s1_node_val,
                     )
                 )
 
-                # new and improved idx calculation
-
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                # so actually its
-                # idx*2 + ((val % 2) + 1)
-                # or
-                # (2*idx + 1) + val % 2
                 body.append(
                     [
-                        ("valu", ("%", vtmp1, vtmp_val, vtwo_const)),
+                        # important
+                        ("alu", ("+", s2_addr1, s1_addr1, vzero_const)),
+                        ("alu", ("+", s2_addr2, s1_addr2, vzero_const)),
+                        ("valu", ("+", s2_idx, s1_idx, vzero_const)),
+                        ("valu", ("+", s2_val, s1_val, vzero_const)),
+                        # debug
                         (
-                            "valu",
+                            "debug",
                             (
-                                "multiply_add",
-                                vtmp_idx,
-                                vtmp_idx,
-                                vtwo_const,
-                                vone_const,
+                                "vcompare",
+                                s1_idx,
+                                [(round, batch + vi, "idx") for vi in range(VLEN)],
+                            ),
+                        ),
+                        (
+                            "debug",
+                            (
+                                "vcompare",
+                                s1_node_val,
+                                [(round, batch + vi, "node_val") for vi in range(VLEN)],
                             ),
                         ),
                     ]
                 )
-                body.append(("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)))
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_idx,
-                            [(round, batch + vi, "next_idx") for vi in range(VLEN)],
-                        ),
-                    )
-                )
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", vtmp1, vtmp_idx, self.scratch["vn_nodes"])))
-                body.append(
-                    ("flow", ("vselect", vtmp_idx, vtmp1, vtmp_idx, vzero_const))
-                )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_idx,
-                            [(round, batch + vi, "wrapped_idx") for vi in range(VLEN)],
-                        ),
-                    )
-                )
 
-                # we alr have the addresses lets go
-                # mem[inp_indices_p + i] = idx
-                # mem[inp_values_p + i] = val
+                body.extend(self.vbuild_hash(s2_val, s2_vtmp1, s2_vtmp2, round, batch))
+
                 body.append(
                     [
-                        ("store", ("vstore", tmp_addr1, vtmp_idx)),
-                        ("store", ("vstore", tmp_addr2, vtmp_val)),
+                        # important
+                        ("alu", ("+", s3_addr1, s2_addr1, vzero_const)),
+                        ("alu", ("+", s3_addr2, s2_addr2, vzero_const)),
+                        ("valu", ("+", s3_idx, s2_idx, vzero_const)),
+                        ("valu", ("+", s3_val, s2_val, vzero_const)),
+                        # debug
+                        (
+                            "debug",
+                            (
+                                "vcompare",
+                                s2_val,
+                                [
+                                    (round, batch + vi, "hashed_val")
+                                    for vi in range(VLEN)
+                                ],
+                            ),
+                        ),
                     ]
+                )
+
+                body.extend(
+                    self.stage_3(
+                        s3_addr1,
+                        s3_addr2,
+                        s3_vtmp1,
+                        s3_idx,
+                        s3_val,
+                        vzero_const,
+                        vone_const,
+                        vtwo_const,
+                    )
                 )
 
         body_instrs = self.build_advanced(body)
