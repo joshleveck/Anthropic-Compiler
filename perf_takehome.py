@@ -19,6 +19,7 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 import random
 import unittest
+from math import ceil
 
 from problem import (
     Engine,
@@ -127,16 +128,7 @@ class KernelBuilder:
             )
 
             slots.append(("valu", (op2, val_hash_addr, vtmp1, vtmp2)))
-            slots.append(
-                (
-                    "debug",
-                    (
-                        "vcompare",
-                        val_hash_addr,
-                        [(round, batch + vi, "hash_stage", hi) for vi in range(VLEN)],
-                    ),
-                )
-            )
+            # Debug removed for performance
 
         return slots
 
@@ -148,6 +140,7 @@ class KernelBuilder:
         Scalar implementation using only scalar ALU and load/store.
         """
         tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
         vtmp1 = self.alloc_scratch("vtmp1", VLEN)
         vtmp2 = self.alloc_scratch("vtmp2", VLEN)
         vtmp3 = self.alloc_scratch("vtmp3", VLEN)
@@ -202,177 +195,82 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scalar scratch registers
+        # Scratch registers
         vtmp_idx = self.alloc_scratch("vtmp_idx", VLEN)
         vtmp_val = self.alloc_scratch("vtmp_val", VLEN)
         vtmp_node_val = self.alloc_scratch("vtmp_node_val", VLEN)
         tmp_addr1 = self.alloc_scratch("tmp_addr1")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
         vtmp_addr3 = self.alloc_scratch("vtmp_addr3", VLEN)
+        
+        # Temporary registers for optimization
+        tmp_node_val_scalar = self.alloc_scratch("tmp_node_val_scalar")
+        vtmp_node_val_broadcast = self.alloc_scratch("vtmp_node_val_broadcast", VLEN)
+        vtmp_first_idx = self.alloc_scratch("vtmp_first_idx", VLEN)
+        vtmp_cmp = self.alloc_scratch("vtmp_cmp", VLEN)
+        tmp_all_equal = self.alloc_scratch("tmp_all_equal")  # scalar: 1 if all equal, 0 otherwise
 
         for round in range(rounds):
             for batch in range(0, batch_size, VLEN):
-
                 i_const = self.scratch_const(batch)
-                # addr sums
-                body.append(
-                    [
-                        (
-                            "alu",
-                            (
-                                "+",
-                                tmp_addr1,
-                                self.scratch["inp_indices_p"],
-                                i_const,
-                            ),
-                        ),
-                        (
-                            "alu",
-                            ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
-                        ),
-                    ]
-                )
-
-                # idx = mem[inp_indices_p + i]
-                # val = mem[inp_values_p + i]
-                body.append(
-                    [
-                        ("load", ("vload", vtmp_idx, tmp_addr1)),
-                        ("load", ("vload", vtmp_val, tmp_addr2)),
-                    ]
-                )
-
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_idx,
-                            [(round, batch + vi, "idx") for vi in range(VLEN)],
-                        ),
-                    )
-                )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_val,
-                            [(round, batch + vi, "val") for vi in range(VLEN)],
-                        ),
-                    )
-                )
-                # node_val = mem[forest_values_p + idx]
-                body.append(
-                    (
-                        "valu",
-                        ("+", vtmp_addr3, self.scratch["vforest_values_p"], vtmp_idx),
-                    )
-                )
+                
+                # Compute addresses and load indices/values
+                body.append([
+                    ("alu", ("+", tmp_addr1, self.scratch["inp_indices_p"], i_const)),
+                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)),
+                ])
+                body.append([
+                    ("load", ("vload", vtmp_idx, tmp_addr1)),
+                    ("load", ("vload", vtmp_val, tmp_addr2)),
+                ])
+                
+                # Compute node value addresses
+                body.append([
+                    ("valu", ("+", vtmp_addr3, self.scratch["vforest_values_p"], vtmp_idx)),
+                ])
+                
+                # Load node values using load_offset
+                # Pack loads efficiently: 2 loads per bundle
                 for li in range(0, VLEN, 2):
-                    body.append(
-                        [
-                            ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li)),
-                            (
-                                "load",
-                                ("load_offset", vtmp_node_val, vtmp_addr3, li + 1),
-                            ),
-                        ]
-                    )
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "compare",
-                                vtmp_node_val + li,
-                                (round, batch + li, "node_val"),
-                            ),
-                        )
-                    )
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "compare",
-                                vtmp_node_val + li + 1,
-                                (round, batch + li + 1, "node_val"),
-                            ),
-                        )
-                    )
-
-                body.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
+                    body.append([
+                        ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li)),
+                        ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li + 1)),
+                    ])
+                
+                # XOR with node values
+                body.append([
+                    ("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)),
+                ])
+                
+                # Hash
                 body.extend(
                     self.vbuild_hash(vtmp_val, vtmp1, vtmp2, round, batch, vtmp3, vtmp4)
                 )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_val,
-                            [(round, batch + vi, "hashed_val") for vi in range(VLEN)],
-                        ),
-                    )
-                )
+                
+                # Update indices
+                body.append([
+                    ("valu", ("%", vtmp1, vtmp_val, vtwo_const)),
+                    ("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, vone_const)),
+                ])
+                body.append([
+                    ("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)),
+                ])
+                
+                # Wrap indices
+                body.append([
+                    ("valu", ("<", vtmp1, vtmp_idx, self.scratch["vn_nodes"])),
+                ])
+                body.append([
+                    ("flow", ("vselect", vtmp_idx, vtmp1, vtmp_idx, vzero_const)),
+                ])
+                
+                # Store updated indices and values
+                body.append([
+                    ("store", ("vstore", tmp_addr1, vtmp_idx)),
+                    ("store", ("vstore", tmp_addr2, vtmp_val)),
+                ])
 
-                # new and improved idx calculation
-
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                # so actually its
-                # idx*2 + ((val % 2) + 1)
-                # or
-                # (2*idx + 1) + val % 2
-                body.append(
-                    [
-                        ("valu", ("%", vtmp1, vtmp_val, vtwo_const)),
-                        (
-                            "valu",
-                            (
-                                "multiply_add",
-                                vtmp_idx,
-                                vtmp_idx,
-                                vtwo_const,
-                                vone_const,
-                            ),
-                        ),
-                    ]
-                )
-                body.append(("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)))
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_idx,
-                            [(round, batch + vi, "next_idx") for vi in range(VLEN)],
-                        ),
-                    )
-                )
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", vtmp1, vtmp_idx, self.scratch["vn_nodes"])))
-                body.append(
-                    ("flow", ("vselect", vtmp_idx, vtmp1, vtmp_idx, vzero_const))
-                )
-                body.append(
-                    (
-                        "debug",
-                        (
-                            "vcompare",
-                            vtmp_idx,
-                            [(round, batch + vi, "wrapped_idx") for vi in range(VLEN)],
-                        ),
-                    )
-                )
-
-                # we alr have the addresses lets go
-                # mem[inp_indices_p + i] = idx
-                # mem[inp_values_p + i] = val
-                body.append(
-                    [
-                        ("store", ("vstore", tmp_addr1, vtmp_idx)),
-                        ("store", ("vstore", tmp_addr2, vtmp_val)),
-                    ]
-                )
+        print(SCRATCH_SIZE - self.scratch_ptr)
 
         body_instrs = self.build_advanced(body)
         self.instrs.extend(body_instrs)
