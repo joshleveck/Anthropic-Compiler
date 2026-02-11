@@ -245,6 +245,23 @@ class KernelBuilder:
 
         return body
 
+    def create_pipe(self):
+        res = []
+
+        for i in range(12):
+            res.append([])
+
+        return (res, [])
+
+    def merge_slots(self, pipe, slots):
+        assert len(slots) <= 12
+
+        for pipe_instr, slot_instr in zip(pipe, slots):
+            if isinstance(slot_instr, list):
+                pipe_instr.extend(slot_instr)
+            else:
+                pipe_instr.append(slot_instr)
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -330,10 +347,17 @@ class KernelBuilder:
         s3_val = self.alloc_scratch("s3_val", VLEN)
         s3_vtmp1 = self.alloc_scratch("s3_vtmp1", VLEN)
 
+        pipeline = [
+            self.create_pipe(),
+            self.create_pipe(),
+            self.create_pipe(),
+        ]
+
         for round in range(rounds):
             for batch in range(0, batch_size, VLEN):
 
-                body.extend(
+                self.merge_slots(
+                    pipeline[0][0],
                     self.stage_1(
                         batch,
                         s1_addr1,
@@ -342,10 +366,10 @@ class KernelBuilder:
                         s1_idx,
                         s1_val,
                         s1_node_val,
-                    )
+                    ),
                 )
 
-                body.append(
+                pipeline[0][1].extend(
                     [
                         # important
                         ("alu", ("+", s2_addr1, s1_addr1, vzero_const)),
@@ -372,9 +396,12 @@ class KernelBuilder:
                     ]
                 )
 
-                body.extend(self.vbuild_hash(s2_val, s2_vtmp1, s2_vtmp2, round, batch))
+                self.merge_slots(
+                    pipeline[1][0],
+                    self.vbuild_hash(s2_val, s2_vtmp1, s2_vtmp2, round, batch),
+                )
 
-                body.append(
+                pipeline[1][1].extend(
                     [
                         # important
                         ("alu", ("+", s3_addr1, s2_addr1, vzero_const)),
@@ -396,7 +423,8 @@ class KernelBuilder:
                     ]
                 )
 
-                body.extend(
+                self.merge_slots(
+                    pipeline[2][0],
                     self.stage_3(
                         s3_addr1,
                         s3_addr2,
@@ -406,8 +434,24 @@ class KernelBuilder:
                         vzero_const,
                         vone_const,
                         vtwo_const,
-                    )
+                    ),
                 )
+
+                body.extend(pipeline[0][0])
+                body.append(pipeline[0][1])
+                del pipeline[0]
+
+                pipeline.append(self.create_pipe())
+
+        body.extend(pipeline[0][0])
+        body.append(pipeline[0][1])
+        del pipeline[0]
+
+        body.extend(pipeline[0][0])
+        body.append(pipeline[0][1])
+        del pipeline[0]
+
+        assert len(pipeline[0][1]) == 0
 
         body_instrs = self.build_advanced(body)
         self.instrs.extend(body_instrs)
