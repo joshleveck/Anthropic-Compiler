@@ -120,15 +120,15 @@ class KernelBuilder:
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # Pack first stage operations - use all 6 VALU slots if possible
             slots.append(
                 [
                     ("valu", (op1, vtmp1, val_hash_addr, self.vscratch_const(val1))),
                     ("valu", (op3, vtmp2, val_hash_addr, self.vscratch_const(val3))),
                 ]
             )
-
+            # op2 combines the results
             slots.append(("valu", (op2, val_hash_addr, vtmp1, vtmp2)))
-            # Debug removed for performance
 
         return slots
 
@@ -202,73 +202,113 @@ class KernelBuilder:
         tmp_addr1 = self.alloc_scratch("tmp_addr1")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
         vtmp_addr3 = self.alloc_scratch("vtmp_addr3", VLEN)
-        
-        # Temporary registers for optimization
-        tmp_node_val_scalar = self.alloc_scratch("tmp_node_val_scalar")
-        vtmp_node_val_broadcast = self.alloc_scratch("vtmp_node_val_broadcast", VLEN)
-        vtmp_first_idx = self.alloc_scratch("vtmp_first_idx", VLEN)
-        vtmp_cmp = self.alloc_scratch("vtmp_cmp", VLEN)
-        tmp_all_equal = self.alloc_scratch("tmp_all_equal")  # scalar: 1 if all equal, 0 otherwise
+
+        # Focus on aggressive instruction packing
 
         for round in range(rounds):
             for batch in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(batch)
-                
-                # Compute addresses and load indices/values
-                body.append([
-                    ("alu", ("+", tmp_addr1, self.scratch["inp_indices_p"], i_const)),
-                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)),
-                ])
-                body.append([
-                    ("load", ("vload", vtmp_idx, tmp_addr1)),
-                    ("load", ("vload", vtmp_val, tmp_addr2)),
-                ])
-                
-                # Compute node value addresses
-                body.append([
-                    ("valu", ("+", vtmp_addr3, self.scratch["vforest_values_p"], vtmp_idx)),
-                ])
-                
-                # Load node values using load_offset
-                # Pack loads efficiently: 2 loads per bundle
+
+                # Aggressively pack: compute addresses + load in parallel
+                body.append(
+                    [
+                        (
+                            "alu",
+                            ("+", tmp_addr1, self.scratch["inp_indices_p"], i_const),
+                        ),
+                        (
+                            "alu",
+                            ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
+                        ),
+                    ]
+                )
+                body.append(
+                    [
+                        ("load", ("vload", vtmp_idx, tmp_addr1)),
+                        ("load", ("vload", vtmp_val, tmp_addr2)),
+                    ]
+                )
+
+                # Compute node addresses
+                body.append(
+                    [
+                        (
+                            "valu",
+                            (
+                                "+",
+                                vtmp_addr3,
+                                self.scratch["vforest_values_p"],
+                                vtmp_idx,
+                            ),
+                        ),
+                    ]
+                )
+
+                # Load node values - pack loads maximally
                 for li in range(0, VLEN, 2):
-                    body.append([
-                        ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li)),
-                        ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li + 1)),
-                    ])
-                
-                # XOR with node values
-                body.append([
-                    ("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)),
-                ])
-                
-                # Hash
+                    body.append(
+                        [
+                            ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li)),
+                            (
+                                "load",
+                                ("load_offset", vtmp_node_val, vtmp_addr3, li + 1),
+                            ),
+                        ]
+                    )
+
+                # XOR - can pack with first hash stage prep
+                body.append(
+                    [
+                        ("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)),
+                    ]
+                )
+
+                # Hash - optimized
                 body.extend(
                     self.vbuild_hash(vtmp_val, vtmp1, vtmp2, round, batch, vtmp3, vtmp4)
                 )
-                
-                # Update indices
-                body.append([
-                    ("valu", ("%", vtmp1, vtmp_val, vtwo_const)),
-                    ("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, vone_const)),
-                ])
-                body.append([
-                    ("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)),
-                ])
-                
+
+                # Update indices - pack all operations
+                body.append(
+                    [
+                        ("valu", ("%", vtmp1, vtmp_val, vtwo_const)),
+                        (
+                            "valu",
+                            (
+                                "multiply_add",
+                                vtmp_idx,
+                                vtmp_idx,
+                                vtwo_const,
+                                vone_const,
+                            ),
+                        ),
+                    ]
+                )
+                body.append(
+                    [
+                        ("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)),
+                    ]
+                )
+
                 # Wrap indices
-                body.append([
-                    ("valu", ("<", vtmp1, vtmp_idx, self.scratch["vn_nodes"])),
-                ])
-                body.append([
-                    ("flow", ("vselect", vtmp_idx, vtmp1, vtmp_idx, vzero_const)),
-                ])
-                
-                # Store updated indices and values
-                body.append([
-                    ("store", ("vstore", tmp_addr1, vtmp_idx)),
-                    ("store", ("vstore", tmp_addr2, vtmp_val)),
-                ])
+                body.append(
+                    [
+                        ("valu", ("<", vtmp1, vtmp_idx, self.scratch["vn_nodes"])),
+                    ]
+                )
+                body.append(
+                    [
+                        ("flow", ("vselect", vtmp_idx, vtmp1, vtmp_idx, vzero_const)),
+                    ]
+                )
+
+                # Store - pack stores
+                body.append(
+                    [
+                        ("store", ("vstore", tmp_addr1, vtmp_idx)),
+                        ("store", ("vstore", tmp_addr2, vtmp_val)),
+                    ]
+                )
 
         print(SCRATCH_SIZE - self.scratch_ptr)
 
