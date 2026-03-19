@@ -19,12 +19,9 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 import random
 import unittest
-from math import ceil
-
 from problem import (
     Engine,
     DebugInfo,
-    SLOT_LIMITS,
     VLEN,
     N_CORES,
     SCRATCH_SIZE,
@@ -37,10 +34,13 @@ from problem import (
     reference_kernel2,
 )
 
+import kernel_schedule
+
 
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
+        self.instrs_pre_schedule = None
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
@@ -140,11 +140,6 @@ class KernelBuilder:
         Scalar implementation using only scalar ALU and load/store.
         """
         tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        vtmp1 = self.alloc_scratch("vtmp1", VLEN)
-        vtmp2 = self.alloc_scratch("vtmp2", VLEN)
-        vtmp3 = self.alloc_scratch("vtmp3", VLEN)
-        vtmp4 = self.alloc_scratch("vtmp4", VLEN)
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -195,118 +190,197 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scratch registers
-        vtmp_idx = self.alloc_scratch("vtmp_idx", VLEN)
-        vtmp_val = self.alloc_scratch("vtmp_val", VLEN)
-        vtmp_node_val = self.alloc_scratch("vtmp_node_val", VLEN)
-        tmp_addr1 = self.alloc_scratch("tmp_addr1")
-        tmp_addr2 = self.alloc_scratch("tmp_addr2")
-        vtmp_addr3 = self.alloc_scratch("vtmp_addr3", VLEN)
+        # Scratch register banks with explicit temp reuse across stages.
+        # Live values per lane:
+        #   idx, val, tmp_a, tmp_b (vectors) + addr1, addr2 (scalars)
+        vec_words_per_lane = 4 * VLEN
+        scalar_words_per_lane = 2
+        words_per_lane = vec_words_per_lane + scalar_words_per_lane
+        scratch_headroom = SCRATCH_SIZE - self.scratch_ptr - 64
+        lanes_by_scratch = max(1, scratch_headroom // words_per_lane)
+        lanes = max(1, min(batch_size // VLEN, lanes_by_scratch))
+        if kernel_schedule.SCHEDULE_MODE == "identity":
+            # In identity mode we skip repartitioning bundles, so cap lanes to keep
+            # the emitted bundles under per-engine slot limits.
+            lanes = min(lanes, 2)
+        vtmp_idx = []
+        vtmp_val = []
+        tmp_addr1 = []
+        tmp_addr2 = []
+        vtmp_a = []
+        vtmp_b = []
+        for lane in range(lanes):
+            vtmp_idx.append(self.alloc_scratch(f"vtmp_idx_{lane}", VLEN))
+            vtmp_val.append(self.alloc_scratch(f"vtmp_val_{lane}", VLEN))
+            tmp_addr1.append(self.alloc_scratch(f"tmp_addr1_{lane}"))
+            tmp_addr2.append(self.alloc_scratch(f"tmp_addr2_{lane}"))
+            vtmp_a.append(self.alloc_scratch(f"vtmp_a_{lane}", VLEN))
+            vtmp_b.append(self.alloc_scratch(f"vtmp_b_{lane}", VLEN))
 
-        # Focus on aggressive instruction packing
+        for batch in range(0, batch_size, VLEN * lanes):
+            lane_count = min(lanes, (batch_size - batch + VLEN - 1) // VLEN)
+            i_consts = [
+                self.scratch_const(batch + lane * VLEN) for lane in range(lane_count)
+            ]
 
-        for round in range(rounds):
-            for batch in range(0, batch_size, VLEN):
-                i_const = self.scratch_const(batch)
-
-                # Aggressively pack: compute addresses + load in parallel
+            # Emit each lane as a long-lived microprogram:
+            # 1) compute/load idx+val once
+            # 2) run all rounds in scratch
+            # 3) store idx+val once at the end
+            # The scheduler can interleave these lane programs cycle-by-cycle.
+            for lane in range(lane_count):
                 body.append(
                     [
                         (
                             "alu",
-                            ("+", tmp_addr1, self.scratch["inp_indices_p"], i_const),
-                        ),
-                        (
-                            "alu",
-                            ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
-                        ),
-                    ]
-                )
-                body.append(
-                    [
-                        ("load", ("vload", vtmp_idx, tmp_addr1)),
-                        ("load", ("vload", vtmp_val, tmp_addr2)),
-                    ]
-                )
-
-                # Compute node addresses
-                body.append(
-                    [
-                        (
-                            "valu",
                             (
                                 "+",
-                                vtmp_addr3,
-                                self.scratch["vforest_values_p"],
-                                vtmp_idx,
+                                tmp_addr1[lane],
+                                self.scratch["inp_indices_p"],
+                                i_consts[lane],
+                            ),
+                        ),
+                        (
+                            "alu",
+                            (
+                                "+",
+                                tmp_addr2[lane],
+                                self.scratch["inp_values_p"],
+                                i_consts[lane],
                             ),
                         ),
                     ]
                 )
+                body.append(
+                    [
+                        ("load", ("vload", vtmp_idx[lane], tmp_addr1[lane])),
+                        ("load", ("vload", vtmp_val[lane], tmp_addr2[lane])),
+                    ]
+                )
 
-                # Load node values - pack loads maximally
-                for li in range(0, VLEN, 2):
+                for round in range(rounds):
                     body.append(
                         [
-                            ("load", ("load_offset", vtmp_node_val, vtmp_addr3, li)),
                             (
-                                "load",
-                                ("load_offset", vtmp_node_val, vtmp_addr3, li + 1),
+                                "valu",
+                                (
+                                    "+",
+                                    vtmp_b[lane],
+                                    self.scratch["vforest_values_p"],
+                                    vtmp_idx[lane],
+                                ),
+                            ),
+                        ]
+                    )
+                    for li in range(VLEN):
+                        body.append(
+                            [
+                                (
+                                    "load",
+                                    ("load_offset", vtmp_a[lane], vtmp_b[lane], li),
+                                ),
+                            ]
+                        )
+                    body.append(
+                        [
+                            (
+                                "valu",
+                                ("^", vtmp_val[lane], vtmp_val[lane], vtmp_a[lane]),
+                            ),
+                        ]
+                    )
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        body.append(
+                            [
+                                (
+                                    "valu",
+                                    (
+                                        op1,
+                                        vtmp_a[lane],
+                                        vtmp_val[lane],
+                                        self.vscratch_const(val1),
+                                    ),
+                                ),
+                                (
+                                    "valu",
+                                    (
+                                        op3,
+                                        vtmp_b[lane],
+                                        vtmp_val[lane],
+                                        self.vscratch_const(val3),
+                                    ),
+                                ),
+                            ]
+                        )
+                        body.append(
+                            [
+                                (
+                                    "valu",
+                                    (
+                                        op2,
+                                        vtmp_val[lane],
+                                        vtmp_a[lane],
+                                        vtmp_b[lane],
+                                    ),
+                                ),
+                            ]
+                        )
+                    body.append(
+                        [
+                            ("valu", ("%", vtmp_a[lane], vtmp_val[lane], vtwo_const)),
+                        ]
+                    )
+                    body.append(
+                        [
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    vtmp_idx[lane],
+                                    vtmp_idx[lane],
+                                    vtwo_const,
+                                    vone_const,
+                                ),
+                            ),
+                        ]
+                    )
+                    body.append(
+                        [
+                            ("valu", ("+", vtmp_idx[lane], vtmp_idx[lane], vtmp_a[lane])),
+                        ]
+                    )
+                    body.append(
+                        [
+                            (
+                                "valu",
+                                (
+                                    "<",
+                                    vtmp_a[lane],
+                                    vtmp_idx[lane],
+                                    self.scratch["vn_nodes"],
+                                ),
+                            ),
+                        ]
+                    )
+                    body.append(
+                        [
+                            (
+                                "flow",
+                                (
+                                    "vselect",
+                                    vtmp_idx[lane],
+                                    vtmp_a[lane],
+                                    vtmp_idx[lane],
+                                    vzero_const,
+                                ),
                             ),
                         ]
                     )
 
-                # XOR - can pack with first hash stage prep
                 body.append(
                     [
-                        ("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)),
-                    ]
-                )
-
-                # Hash - optimized
-                body.extend(
-                    self.vbuild_hash(vtmp_val, vtmp1, vtmp2, round, batch, vtmp3, vtmp4)
-                )
-
-                # Update indices - pack all operations
-                body.append(
-                    [
-                        ("valu", ("%", vtmp1, vtmp_val, vtwo_const)),
-                        (
-                            "valu",
-                            (
-                                "multiply_add",
-                                vtmp_idx,
-                                vtmp_idx,
-                                vtwo_const,
-                                vone_const,
-                            ),
-                        ),
-                    ]
-                )
-                body.append(
-                    [
-                        ("valu", ("+", vtmp_idx, vtmp_idx, vtmp1)),
-                    ]
-                )
-
-                # Wrap indices
-                body.append(
-                    [
-                        ("valu", ("<", vtmp1, vtmp_idx, self.scratch["vn_nodes"])),
-                    ]
-                )
-                body.append(
-                    [
-                        ("flow", ("vselect", vtmp_idx, vtmp1, vtmp_idx, vzero_const)),
-                    ]
-                )
-
-                # Store - pack stores
-                body.append(
-                    [
-                        ("store", ("vstore", tmp_addr1, vtmp_idx)),
-                        ("store", ("vstore", tmp_addr2, vtmp_val)),
+                        ("store", ("vstore", tmp_addr1[lane], vtmp_idx[lane])),
+                        ("store", ("vstore", tmp_addr2[lane], vtmp_val[lane])),
                     ]
                 )
 
@@ -317,8 +391,23 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+        self.instrs_pre_schedule = list(self.instrs)
+        self.instrs = kernel_schedule.apply_schedule(
+            self.instrs_pre_schedule, kernel_schedule.SCHEDULE_MODE
+        )
+        kernel_schedule.verify_slot_limits(self.instrs)
+
 
 BASELINE = 147734
+# Recorded with kernel_schedule.SCHEDULE_MODE=list, seed=123, do_kernel_test(10, 16, 256)
+# With SCHEDULE_MODE=list (default in kernel_schedule)
+BASELINE_KERNEL_CYCLES = 2230
+# With SCHEDULE_MODE=identity (instrs == instrs_pre_schedule)
+IDENTITY_BASELINE_KERNEL_CYCLES = 13998
+# SHA256 of pickle(instrs_pre_schedule) for build_kernel(10, 2**11-1, 256, 16)
+BASELINE_PRE_SCHEDULE_SHA256 = (
+    "394336ff848685aae7de46c18b7f064111e87b4e7db44ca605a91bb1d20b9305"
+)
 
 
 def do_kernel_test(
@@ -372,6 +461,24 @@ def do_kernel_test(
 
 
 class Tests(unittest.TestCase):
+    def test_schedule_identity_preserves_program(self):
+        old = kernel_schedule.SCHEDULE_MODE
+        kernel_schedule.SCHEDULE_MODE = "identity"
+        try:
+            kb = KernelBuilder()
+            kb.build_kernel(10, 2**11 - 1, 256, 16)
+            self.assertEqual(kb.instrs, kb.instrs_pre_schedule)
+        finally:
+            kernel_schedule.SCHEDULE_MODE = old
+
+    def test_pre_schedule_fingerprint_stable(self):
+        kb = KernelBuilder()
+        kb.build_kernel(10, 2**11 - 1, 256, 16)
+        self.assertEqual(
+            kernel_schedule.instrs_fingerprint(kb.instrs_pre_schedule),
+            BASELINE_PRE_SCHEDULE_SHA256,
+        )
+
     def test_ref_kernels(self):
         """
         Test the reference kernels against each other
@@ -401,7 +508,8 @@ class Tests(unittest.TestCase):
     #             )
 
     def test_kernel_cycles(self):
-        do_kernel_test(10, 16, 256)
+        c = do_kernel_test(10, 16, 256)
+        self.assertEqual(c, BASELINE_KERNEL_CYCLES)
 
 
 # To run all the tests:
