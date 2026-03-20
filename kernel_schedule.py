@@ -244,7 +244,9 @@ def schedule_region_identity(region: list[Instruction]) -> list[Instruction]:
     return list(region)
 
 
-def _writes_conflict(writes_a: list[tuple[int, int]], writes_b: list[tuple[int, int]]) -> bool:
+def _writes_conflict(
+    writes_a: list[tuple[int, int]], writes_b: list[tuple[int, int]]
+) -> bool:
     for wa in writes_a:
         for wb in writes_b:
             if ranges_overlap(wa, wb):
@@ -320,29 +322,43 @@ def schedule_region_list(region: list[Instruction]) -> list[Instruction]:
         if succs[i]:
             cplen[i] = 1 + max(cplen[s] for s in succs[i])
 
-    engine_weight = {"flow": 4, "load": 3, "store": 3, "valu": 2, "alu": 1, "debug": 0}
+    # Lower = schedule sooner. Prefer filling bottleneck engines (few slots per cycle)
+    # before ALU, so startup does not spend cycles with idle load/valu while ALU packs.
+    ENGINE_SCHED_ORDER = {
+        "load": 0,
+        "valu": 1,
+        "flow": 2,
+        "store": 3,
+        "alu": 4,
+        "debug": 5,
+    }
     indeg = [len(preds[i]) for i in range(n)]
     ready: set[int] = {i for i in range(n) if indeg[i] == 0}
     unscheduled: set[int] = set(range(n))
     bundles: list[Instruction] = []
+
+    def _pick_best(cand: list[int]) -> int:
+        return min(
+            cand,
+            key=lambda i: (
+                ops[i].seq,
+                ENGINE_SCHED_ORDER.get(ops[i].engine, 99),
+                -cplen[i],
+            ),
+        )
 
     while unscheduled:
         bundle_idxs: list[int] = []
         bundle_ops: list[IROp] = []
 
         while True:
-            candidates = [i for i in ready if _can_pack_together(bundle_ops, ops[i], i, preds)]
+            candidates = [
+                i for i in ready if _can_pack_together(bundle_ops, ops[i], i, preds)
+            ]
             if not candidates:
                 break
-            # Maximize critical path first; then prioritize constrained engines.
-            best = max(
-                candidates,
-                key=lambda i: (
-                    cplen[i],
-                    engine_weight.get(ops[i].engine, 0),
-                    -ops[i].seq,
-                ),
-            )
+            # Among ready ops: prefer load/valu (tight slot limits), then longest critical path.
+            best = _pick_best(candidates)
             bundle_idxs.append(best)
             bundle_ops.append(ops[best])
             ready.remove(best)
@@ -351,12 +367,14 @@ def schedule_region_list(region: list[Instruction]) -> list[Instruction]:
             # Fallback: schedule one ready op to guarantee progress.
             if not ready:
                 raise RuntimeError("scheduler: no ready op but work remains")
-            best = min(ready, key=lambda i: ops[i].seq)
+            best = _pick_best(list(ready))
             bundle_idxs = [best]
             bundle_ops = [ops[best]]
             ready.remove(best)
 
-        bundles.append(pack_ops_to_instruction([(ops[i].engine, ops[i].slot) for i in bundle_idxs]))
+        bundles.append(
+            pack_ops_to_instruction([(ops[i].engine, ops[i].slot) for i in bundle_idxs])
+        )
 
         newly_ready: list[int] = []
         for i in bundle_idxs:
@@ -371,9 +389,7 @@ def schedule_region_list(region: list[Instruction]) -> list[Instruction]:
     return bundles + tail
 
 
-def apply_schedule(
-    instrs: list[Instruction], mode: str
-) -> list[Instruction]:
+def apply_schedule(instrs: list[Instruction], mode: str) -> list[Instruction]:
     """
     mode: 'identity' | 'list'
     """

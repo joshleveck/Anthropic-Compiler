@@ -248,11 +248,7 @@ class KernelBuilder:
                 self.scratch_const(batch + lane * VLEN) for lane in range(lane_count)
             ]
 
-            # Emit each lane as a long-lived microprogram:
-            # 1) compute/load idx+val once
-            # 2) run all rounds in scratch
-            # 3) store idx+val once at the end
-            # The scheduler can interleave these lane programs cycle-by-cycle.
+            # 1) Per-lane pointers + initial vload (idx/val live in scratch for all rounds).
             for lane in range(lane_count):
                 body.append(
                     [
@@ -283,13 +279,15 @@ class KernelBuilder:
                     ]
                 )
 
-                for round in range(rounds):
-                    round_in_tree = round % (forest_height + 1)
-                    is_zero_round = round_in_tree == 0
-                    is_one_two_round = round_in_tree == 1
-                    is_wrap_around_round = round_in_tree == forest_height
-                    _ = (is_zero_round, is_one_two_round)
+            # 2) Round-major: all lanes per tree round — helps the scheduler mix lanes.
+            for round in range(rounds):
+                round_in_tree = round % (forest_height + 1)
+                is_zero_round = round_in_tree == 0
+                is_one_two_round = round_in_tree == 1
+                is_wrap_around_round = round_in_tree == forest_height
+                _ = (is_zero_round, is_one_two_round)
 
+                for lane in range(lane_count):
                     if is_zero_round:
                         body.append(
                             [
@@ -341,12 +339,26 @@ class KernelBuilder:
                                 ),
                             ]
                         )
-                        for li in range(VLEN):
+                        for li in range(0, VLEN, 2):
                             body.append(
                                 [
                                     (
                                         "load",
-                                        ("load_offset", vtmp_a[lane], vtmp_b[lane], li),
+                                        (
+                                            "load_offset",
+                                            vtmp_a[lane],
+                                            vtmp_b[lane],
+                                            li,
+                                        ),
+                                    ),
+                                    (
+                                        "load",
+                                        (
+                                            "load_offset",
+                                            vtmp_a[lane],
+                                            vtmp_b[lane],
+                                            li + 1,
+                                        ),
                                     ),
                                 ]
                             )
@@ -399,11 +411,6 @@ class KernelBuilder:
                     body.append(
                         [
                             ("valu", ("%", vtmp_a[lane], vtmp_val[lane], vtwo_const)),
-                        ]
-                    )
-
-                    body.append(
-                        [
                             (
                                 "valu",
                                 (
@@ -427,8 +434,6 @@ class KernelBuilder:
                     )
 
                     if is_wrap_around_round:
-                        # At the wrap-around depth we always move past the last node,
-                        # so skip bounds-check/select and hardcode next idx=0.
                         body.append(
                             [
                                 (
@@ -438,6 +443,7 @@ class KernelBuilder:
                             ]
                         )
 
+            for lane in range(lane_count):
                 body.append(
                     [
                         ("store", ("vstore", tmp_addr1[lane], vtmp_idx[lane])),
@@ -467,7 +473,7 @@ BASELINE_KERNEL_CYCLES = 2080
 IDENTITY_BASELINE_KERNEL_CYCLES = 12053
 # SHA256 of pickle(instrs_pre_schedule) for build_kernel(10, 2**11-1, 256, 16)
 BASELINE_PRE_SCHEDULE_SHA256 = (
-    "6b35146714631d5d5e0c71c4226243f4c7cb2e7c623be16d0091fcf405682b1b"
+    "f7dc716c764cd4a05baa5511c2dc5802a3881cfd2744af11dd1fd99bc2fd2c91"
 )
 
 
