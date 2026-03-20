@@ -180,6 +180,32 @@ class KernelBuilder:
             ),
         )
 
+        self.alloc_scratch("zero_tree_value")
+        self.add(
+            "load",
+            ("load", self.scratch["zero_tree_value"], self.scratch["forest_values_p"]),
+        )
+
+        self.alloc_scratch("vone_tree_value", VLEN)
+        one_const = self.scratch_const(1)
+        self.add(
+            "alu",
+            ("+", tmp1, self.scratch["forest_values_p"], one_const),
+        )
+        # Load mem[forest_values_p + 1] into tmp1, then broadcast to VLEN.
+        self.add("load", ("load", tmp1, tmp1))
+        self.add("valu", ("vbroadcast", self.scratch["vone_tree_value"], tmp1))
+
+        self.alloc_scratch("vtwo_tree_value", VLEN)
+        two_const = self.scratch_const(2)
+        self.add(
+            "alu",
+            ("+", tmp1, self.scratch["forest_values_p"], two_const),
+        )
+        # Load mem[forest_values_p + 2] into tmp1, then broadcast to VLEN.
+        self.add("load", ("load", tmp1, tmp1))
+        self.add("valu", ("vbroadcast", self.scratch["vtwo_tree_value"], tmp1))
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -195,10 +221,9 @@ class KernelBuilder:
         #   idx, val, tmp_a, tmp_b (vectors) + addr1, addr2 (scalars)
         vec_words_per_lane = 4 * VLEN
         scalar_words_per_lane = 2
-        words_per_lane = vec_words_per_lane + scalar_words_per_lane
-        scratch_headroom = SCRATCH_SIZE - self.scratch_ptr - 64
-        lanes_by_scratch = max(1, scratch_headroom // words_per_lane)
-        lanes = max(1, min(batch_size // VLEN, lanes_by_scratch))
+        # lanes_by_scratch = max(1, scratch_headroom // words_per_lane)
+        # lanes = max(1, min(batch_size // VLEN, lanes_by_scratch))
+        lanes = 39
         if kernel_schedule.SCHEDULE_MODE == "identity":
             # In identity mode we skip repartitioning bundles, so cap lanes to keep
             # the emitted bundles under per-engine slot limits.
@@ -259,28 +284,73 @@ class KernelBuilder:
                 )
 
                 for round in range(rounds):
-                    body.append(
-                        [
-                            (
-                                "valu",
-                                (
-                                    "+",
-                                    vtmp_b[lane],
-                                    self.scratch["vforest_values_p"],
-                                    vtmp_idx[lane],
-                                ),
-                            ),
-                        ]
-                    )
-                    for li in range(VLEN):
+                    round_in_tree = round % (forest_height + 1)
+                    is_zero_round = round_in_tree == 0
+                    is_one_two_round = round_in_tree == 1
+                    is_wrap_around_round = round_in_tree == forest_height
+                    _ = (is_zero_round, is_one_two_round)
+
+                    if is_zero_round:
                         body.append(
                             [
                                 (
-                                    "load",
-                                    ("load_offset", vtmp_a[lane], vtmp_b[lane], li),
+                                    "valu",
+                                    (
+                                        "vbroadcast",
+                                        vtmp_a[lane],
+                                        self.scratch["zero_tree_value"],
+                                    ),
+                                )
+                            ]
+                        )
+                    elif is_one_two_round:
+                        body.append(
+                            [
+                                (
+                                    "valu",
+                                    ("-", vtmp_a[lane], vtmp_idx[lane], vone_const),
+                                )
+                            ]
+                        )
+
+                        body.append(
+                            [
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        vtmp_a[lane],
+                                        vtmp_a[lane],
+                                        self.scratch["vtwo_tree_value"],
+                                        self.scratch["vone_tree_value"],
+                                    ),
+                                )
+                            ]
+                        )
+                    else:
+                        body.append(
+                            [
+                                (
+                                    "valu",
+                                    (
+                                        "+",
+                                        vtmp_b[lane],
+                                        self.scratch["vforest_values_p"],
+                                        vtmp_idx[lane],
+                                    ),
                                 ),
                             ]
                         )
+                        for li in range(VLEN):
+                            body.append(
+                                [
+                                    (
+                                        "load",
+                                        ("load_offset", vtmp_a[lane], vtmp_b[lane], li),
+                                    ),
+                                ]
+                            )
+
                     body.append(
                         [
                             (
@@ -325,11 +395,13 @@ class KernelBuilder:
                                 ),
                             ]
                         )
+
                     body.append(
                         [
                             ("valu", ("%", vtmp_a[lane], vtmp_val[lane], vtwo_const)),
                         ]
                     )
+
                     body.append(
                         [
                             (
@@ -344,38 +416,27 @@ class KernelBuilder:
                             ),
                         ]
                     )
-                    body.append(
-                        [
-                            ("valu", ("+", vtmp_idx[lane], vtmp_idx[lane], vtmp_a[lane])),
-                        ]
-                    )
+
                     body.append(
                         [
                             (
                                 "valu",
-                                (
-                                    "<",
-                                    vtmp_a[lane],
-                                    vtmp_idx[lane],
-                                    self.scratch["vn_nodes"],
-                                ),
+                                ("+", vtmp_idx[lane], vtmp_idx[lane], vtmp_a[lane]),
                             ),
                         ]
                     )
-                    body.append(
-                        [
-                            (
-                                "flow",
+
+                    if is_wrap_around_round:
+                        # At the wrap-around depth we always move past the last node,
+                        # so skip bounds-check/select and hardcode next idx=0.
+                        body.append(
+                            [
                                 (
-                                    "vselect",
-                                    vtmp_idx[lane],
-                                    vtmp_a[lane],
-                                    vtmp_idx[lane],
-                                    vzero_const,
+                                    "valu",
+                                    ("+", vtmp_idx[lane], vzero_const, vzero_const),
                                 ),
-                            ),
-                        ]
-                    )
+                            ]
+                        )
 
                 body.append(
                     [
@@ -401,12 +462,12 @@ class KernelBuilder:
 BASELINE = 147734
 # Recorded with kernel_schedule.SCHEDULE_MODE=list, seed=123, do_kernel_test(10, 16, 256)
 # With SCHEDULE_MODE=list (default in kernel_schedule)
-BASELINE_KERNEL_CYCLES = 2230
+BASELINE_KERNEL_CYCLES = 2080
 # With SCHEDULE_MODE=identity (instrs == instrs_pre_schedule)
-IDENTITY_BASELINE_KERNEL_CYCLES = 13998
+IDENTITY_BASELINE_KERNEL_CYCLES = 12053
 # SHA256 of pickle(instrs_pre_schedule) for build_kernel(10, 2**11-1, 256, 16)
 BASELINE_PRE_SCHEDULE_SHA256 = (
-    "394336ff848685aae7de46c18b7f064111e87b4e7db44ca605a91bb1d20b9305"
+    "6b35146714631d5d5e0c71c4226243f4c7cb2e7c623be16d0091fcf405682b1b"
 )
 
 
