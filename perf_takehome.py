@@ -279,15 +279,15 @@ class KernelBuilder:
                     ]
                 )
 
-            # 2) Round-major: all lanes per tree round — helps the scheduler mix lanes.
-            for round in range(rounds):
-                round_in_tree = round % (forest_height + 1)
-                is_zero_round = round_in_tree == 0
-                is_one_two_round = round_in_tree == 1
-                is_wrap_around_round = round_in_tree == forest_height
-                _ = (is_zero_round, is_one_two_round)
+                # 2) Round-major: all lanes per tree round — helps the scheduler mix lanes.
+                for round in range(rounds):
+                    round_in_tree = round % (forest_height + 1)
+                    is_zero_round = round_in_tree == 0
+                    is_one_two_round = round_in_tree == 1
+                    is_wrap_around_round = round_in_tree == forest_height
+                    _ = (is_zero_round, is_one_two_round)
 
-                for lane in range(lane_count):
+                    # for lane in range(lane_count):
                     if is_zero_round:
                         body.append(
                             [
@@ -443,13 +443,13 @@ class KernelBuilder:
                             ]
                         )
 
-            for lane in range(lane_count):
-                body.append(
-                    [
-                        ("store", ("vstore", tmp_addr1[lane], vtmp_idx[lane])),
-                        ("store", ("vstore", tmp_addr2[lane], vtmp_val[lane])),
-                    ]
-                )
+                    # for lane in range(lane_count):
+                    body.append(
+                        [
+                            ("store", ("vstore", tmp_addr1[lane], vtmp_idx[lane])),
+                            ("store", ("vstore", tmp_addr2[lane], vtmp_val[lane])),
+                        ]
+                    )
 
         print(SCRATCH_SIZE - self.scratch_ptr)
 
