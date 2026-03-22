@@ -88,6 +88,8 @@ struct FuncLowering {
     current: BlockId,
     /// Cached scalar 0 for vector lane copy (`+` with zero).
     zero_scalar: Option<RegisterId>,
+    /// One `const` register per immediate used by `myhash` / `vhash` (shared across all calls).
+    hash_const_cache: HashMap<i32, RegisterId>,
 }
 
 impl FuncLowering {
@@ -98,7 +100,18 @@ impl FuncLowering {
             vars: HashMap::new(),
             current,
             zero_scalar: None,
+            hash_const_cache: HashMap::new(),
         }
+    }
+
+    /// Materialize a hash-stage immediate once per function; reuse the same scratch for every `myhash`/`vhash` call.
+    fn hash_const_reg(&mut self, v: i32) -> RegisterId {
+        if let Some(&r) = self.hash_const_cache.get(&v) {
+            return r;
+        }
+        let r = self.emit_const(v);
+        self.hash_const_cache.insert(v, r);
+        r
     }
 
     fn zero_reg(&mut self) -> RegisterId {
@@ -553,8 +566,8 @@ impl FuncLowering {
                     ("^", 0xB55A4F09_u32 as i32, "^", ">>", 16),
                 ];
                 for (op1, v1, op2, op3, v3) in stages {
-                    let c1 = self.emit_const(v1);
-                    let c3 = self.emit_const(v3);
+                    let c1 = self.hash_const_reg(v1);
+                    let c3 = self.hash_const_reg(v3);
                     let t1 = self.emit_binary(op_text_to_bin(op1), a, c1, ValueType::Vector);
                     let t2 = self.emit_binary(op_text_to_bin(op3), a, c3, ValueType::Vector);
                     a = self.emit_binary(op_text_to_bin(op2), t1, t2, ValueType::Vector);
@@ -573,8 +586,8 @@ impl FuncLowering {
                     ("^", 0xB55A4F09_u32 as i32, "^", ">>", 16),
                 ];
                 for (op1, v1, op2, op3, v3) in stages {
-                    let c1 = self.emit_const(v1);
-                    let c3 = self.emit_const(v3);
+                    let c1 = self.hash_const_reg(v1);
+                    let c3 = self.hash_const_reg(v3);
                     let t1 = self.emit_binary(op_text_to_bin(op1), a, c1, ValueType::Scalar);
                     let t2 = self.emit_binary(op_text_to_bin(op3), a, c3, ValueType::Scalar);
                     a = self.emit_binary(op_text_to_bin(op2), t1, t2, ValueType::Scalar);
