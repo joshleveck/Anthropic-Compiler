@@ -40,6 +40,7 @@ pub enum Slot {
     Jump(usize),
     Halt,
     Pause,
+    Sync,
     /// `("compare", scratch_addr, (round, batch, tag_str))` — matches `reference_kernel2` trace keys.
     DebugCompare(usize, i32, i32, u8),
 }
@@ -62,6 +63,7 @@ impl Slot {
             Slot::Jump(p) => format!("(\"jump\", {p})"),
             Slot::Halt => "(\"halt\",)".to_string(),
             Slot::Pause => "(\"pause\",)".to_string(),
+            Slot::Sync => "(\"sync\",)".to_string(),
             Slot::DebugCompare(addr, r, b, tag) => {
                 let ts = debug_tag_str(*tag);
                 format!("(\"compare\", {addr}, ({r}, {b}, \"{ts}\"))")
@@ -86,6 +88,7 @@ impl Slot {
             Slot::Jump(p) => format!(r#"["jump",{}]"#, p),
             Slot::Halt => r#"["halt"]"#.to_string(),
             Slot::Pause => r#"["pause"]"#.to_string(),
+            Slot::Sync => r#"["sync"]"#.to_string(),
             Slot::DebugCompare(addr, r, b, tag) => {
                 let ts = debug_tag_str(*tag);
                 format!("[\"compare\",{},[{},{},\"{}\"]]", addr, r, b, ts)
@@ -283,6 +286,231 @@ pub type MachineProgram = Vec<InstructionBundle>;
 /// Base scratch word -> (symbolic name, length in 32-bit words). Matches `problem.DebugInfo.scratch_map`.
 pub type ScratchDebugMap = HashMap<usize, (String, usize)>;
 
+type ScheduledBlock = Vec<Vec<crate::vlir::InstrId>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineKind {
+    Alu,
+    Valu,
+    Load,
+    Store,
+    Flow,
+    Debug,
+}
+
+impl EngineKind {
+    fn slot_limit(self) -> usize {
+        match self {
+            EngineKind::Alu => 12,
+            EngineKind::Valu => 6,
+            EngineKind::Load => 2,
+            EngineKind::Store => 2,
+            EngineKind::Flow => 1,
+            EngineKind::Debug => 64,
+        }
+    }
+}
+
+fn instr_engine_kind(inst: &crate::vlir::Instruction) -> EngineKind {
+    match &inst.kind {
+        InstrKind::Const { .. } | InstrKind::Load(_) => EngineKind::Load,
+        InstrKind::Store(_) => EngineKind::Store,
+        InstrKind::Flow(_) => EngineKind::Flow,
+        InstrKind::DebugCompare { .. } => EngineKind::Debug,
+        InstrKind::Alu(_) | InstrKind::VectorLaneStore { .. } | InstrKind::VectorLaneLoad { .. } => {
+            EngineKind::Alu
+        }
+        InstrKind::Valu(_) => EngineKind::Valu,
+    }
+}
+
+fn def_regs(inst: &crate::vlir::Instruction) -> Vec<RegisterId> {
+    match &inst.kind {
+        // Partial vector write is still a write dependency for scheduling.
+        InstrKind::VectorLaneStore { vec, .. } => vec![*vec],
+        _ => match def_of_instruction(inst) {
+            Some(r) => vec![r],
+            None => Vec::new(),
+        },
+    }
+}
+
+fn has_memory_load(inst: &crate::vlir::Instruction) -> bool {
+    matches!(inst.kind, InstrKind::Load(_))
+}
+
+fn has_memory_store(inst: &crate::vlir::Instruction) -> bool {
+    matches!(inst.kind, InstrKind::Store(_))
+}
+
+fn has_observable_ordering(inst: &crate::vlir::Instruction) -> bool {
+    is_side_effect_instruction(inst) || matches!(inst.kind, InstrKind::Flow(_))
+}
+
+fn is_sync_barrier(inst: &crate::vlir::Instruction) -> bool {
+    matches!(inst.kind, InstrKind::Flow(FlowInst::Sync))
+}
+
+fn shares_reg(a: &[RegisterId], b: &[RegisterId]) -> bool {
+    a.iter().any(|x| b.contains(x))
+}
+
+fn has_dependency(
+    a: &crate::vlir::Instruction,
+    b: &crate::vlir::Instruction,
+    uses_a: &[RegisterId],
+    defs_a: &[RegisterId],
+    uses_b: &[RegisterId],
+    defs_b: &[RegisterId],
+) -> bool {
+    // Full fence semantics for explicit barriers.
+    if is_sync_barrier(a) || is_sync_barrier(b) {
+        return true;
+    }
+
+    // Register hazards under end-of-cycle writeback:
+    // RAW, WAW, WAR are all ordering constraints.
+    if shares_reg(defs_a, uses_b) || shares_reg(defs_a, defs_b) || shares_reg(uses_a, defs_b) {
+        return true;
+    }
+
+    // Conservative memory model: preserve order around any store.
+    let mem_a = has_memory_load(a) || has_memory_store(a);
+    let mem_b = has_memory_load(b) || has_memory_store(b);
+    if mem_a && mem_b && (has_memory_store(a) || has_memory_store(b)) {
+        return true;
+    }
+
+    // Keep externally observable side effects in original order.
+    if has_observable_ordering(a) && has_observable_ordering(b) {
+        return true;
+    }
+
+    false
+}
+
+fn build_scheduled_block(insts: &[&crate::vlir::Instruction]) -> ScheduledBlock {
+    let n = insts.len();
+    if n <= 1 {
+        return insts.iter().map(|x| vec![x.id]).collect();
+    }
+
+    let mut uses: Vec<Vec<RegisterId>> = Vec::with_capacity(n);
+    let mut defs: Vec<Vec<RegisterId>> = Vec::with_capacity(n);
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indeg: Vec<usize> = vec![0; n];
+    for inst in insts {
+        uses.push(uses_in_instruction(inst));
+        defs.push(def_regs(inst));
+    }
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if has_dependency(insts[i], insts[j], &uses[i], &defs[i], &uses[j], &defs[j]) {
+                succs[i].push(j);
+                indeg[j] += 1;
+            }
+        }
+    }
+
+    // Critical-path priority: max successor depth + latency.
+    let mut crit = vec![0usize; n];
+    for i in (0..n).rev() {
+        let best_succ = succs[i].iter().map(|&s| crit[s]).max().unwrap_or(0);
+        crit[i] = best_succ + insts[i].latency as usize;
+    }
+
+    let mut ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    let mut scheduled = vec![false; n];
+    let mut remaining = n;
+    let mut cycles: ScheduledBlock = Vec::new();
+
+    while remaining > 0 {
+        ready.sort_by(|&a, &b| crit[b].cmp(&crit[a]).then(a.cmp(&b)));
+        let mut cap_alu = EngineKind::Alu.slot_limit();
+        let mut cap_valu = EngineKind::Valu.slot_limit();
+        let mut cap_load = EngineKind::Load.slot_limit();
+        let mut cap_store = EngineKind::Store.slot_limit();
+        let mut cap_flow = EngineKind::Flow.slot_limit();
+        let mut cap_debug = EngineKind::Debug.slot_limit();
+
+        let mut picked: Vec<usize> = Vec::new();
+        let mut next_ready: Vec<usize> = Vec::new();
+        for idx in ready.drain(..) {
+            if scheduled[idx] {
+                continue;
+            }
+            let kind = instr_engine_kind(insts[idx]);
+            let can_fit = match kind {
+                EngineKind::Alu => cap_alu > 0,
+                EngineKind::Valu => cap_valu > 0,
+                EngineKind::Load => cap_load > 0,
+                EngineKind::Store => cap_store > 0,
+                EngineKind::Flow => cap_flow > 0,
+                EngineKind::Debug => cap_debug > 0,
+            };
+            if can_fit {
+                match kind {
+                    EngineKind::Alu => cap_alu -= 1,
+                    EngineKind::Valu => cap_valu -= 1,
+                    EngineKind::Load => cap_load -= 1,
+                    EngineKind::Store => cap_store -= 1,
+                    EngineKind::Flow => cap_flow -= 1,
+                    EngineKind::Debug => cap_debug -= 1,
+                }
+                picked.push(idx);
+            } else {
+                next_ready.push(idx);
+            }
+        }
+
+        // Should not happen with positive capacities; fallback to keep progress.
+        if picked.is_empty() && !next_ready.is_empty() {
+            picked.push(next_ready.remove(0));
+        }
+
+        for &idx in &picked {
+            if scheduled[idx] {
+                continue;
+            }
+            scheduled[idx] = true;
+            remaining -= 1;
+        }
+
+        for &idx in &picked {
+            for &s in &succs[idx] {
+                indeg[s] -= 1;
+                if indeg[s] == 0 && !scheduled[s] {
+                    next_ready.push(s);
+                }
+            }
+        }
+
+        next_ready.sort_unstable();
+        next_ready.dedup();
+        ready = next_ready;
+        cycles.push(picked.into_iter().map(|i| insts[i].id).collect());
+    }
+
+    cycles
+}
+
+fn schedule_emitted_blocks(
+    func: &Function,
+    emitted: &HashSet<crate::vlir::InstrId>,
+) -> Vec<ScheduledBlock> {
+    let mut out = Vec::with_capacity(func.blocks.len());
+    for block in &func.blocks {
+        let emitted_insts: Vec<&crate::vlir::Instruction> = block
+            .instructions
+            .iter()
+            .filter(|inst| emitted.contains(&inst.id))
+            .collect();
+        out.push(build_scheduled_block(&emitted_insts));
+    }
+    out
+}
+
 fn terminator_bundle_count(term: &Terminator) -> usize {
     // Must match `lower_terminator`: Branch uses two bundles (cond_jump, then jump)
     // because the simulator allows only one flow slot per cycle.
@@ -304,74 +532,76 @@ fn build_scratch_debug_map(func: &Function, layout: &ScratchLayout) -> Result<Sc
 
 pub fn lower_function(func: &Function) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
     let emitted = build_emission_plan(func);
-    let use_counts = collect_use_counts(func, &emitted);
-    let scratch = build_greedy_scratch_layout(func, &use_counts, &emitted)?;
+    let scheduled_blocks = schedule_emitted_blocks(func, &emitted);
+    let use_counts = collect_use_counts(func, &scheduled_blocks);
+    let scratch = build_greedy_scratch_layout(func, &use_counts, &scheduled_blocks)?;
     let scratch_debug = build_scratch_debug_map(func, &scratch)?;
 
     let mut block_pc = HashMap::new();
     let mut pc = 0usize;
-    for block in &func.blocks {
+    for (bi, block) in func.blocks.iter().enumerate() {
         block_pc.insert(block.id, pc);
-        let mut count = 0usize;
-        for inst in &block.instructions {
-            if !emitted.contains(&inst.id) {
-                continue;
-            }
-            count += 1;
-        }
+        let count = scheduled_blocks[bi].len();
         pc += count + terminator_bundle_count(&block.terminator);
     }
 
     let mut bundles = Vec::new();
+    let mut inst_by_id: HashMap<crate::vlir::InstrId, &crate::vlir::Instruction> = HashMap::new();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if !emitted.contains(&inst.id) {
-                continue;
-            }
+            inst_by_id.insert(inst.id, inst);
+        }
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for cycle in &scheduled_blocks[bi] {
             let mut b = InstructionBundle::default();
-            match &inst.kind {
-                InstrKind::Const { dst, value } => {
-                    b.load.push(Slot::Const(scratch.addr(*dst)?, *value));
-                }
-                InstrKind::VectorLaneStore {
-                    vec,
-                    lane,
-                    src,
-                    zero,
-                } => {
-                    let base = scratch.addr(*vec)?;
-                    let dst_slot = base + *lane as usize;
-                    let a = scratch.addr(*src)?;
-                    let z = scratch.addr(*zero)?;
-                    b.alu.push(Slot::Alu("+", dst_slot, a, z));
-                }
-                InstrKind::VectorLaneLoad {
-                    dst,
-                    vec,
-                    lane,
-                    zero,
-                } => {
-                    let base = scratch.addr(*vec)?;
-                    let src_lane = base + *lane as usize;
-                    let d = scratch.addr(*dst)?;
-                    let z = scratch.addr(*zero)?;
-                    b.alu.push(Slot::Alu("+", d, src_lane, z));
-                }
-                InstrKind::Alu(ai) => b.alu.push(lower_alu(ai, &scratch)?),
-                InstrKind::Valu(vi) => b.valu.push(lower_valu(vi, &scratch)?),
-                InstrKind::Flow(fi) => b.flow.push(lower_flow(fi, &scratch)?),
-                InstrKind::Load(li) => b.load.push(lower_load(li, &scratch)?),
-                InstrKind::Store(si) => b.store.push(lower_store(si, &scratch)?),
-                InstrKind::DebugCompare {
-                    value,
-                    round,
-                    batch,
-                    tag,
-                } => {
-                    let a = scratch.addr(*value)?;
-                    b.debug.push(Slot::DebugCompare(a, *round, *batch, *tag));
+            for iid in cycle {
+                let inst = inst_by_id[iid];
+                match &inst.kind {
+                    InstrKind::Const { dst, value } => {
+                        b.load.push(Slot::Const(scratch.addr(*dst)?, *value));
+                    }
+                    InstrKind::VectorLaneStore {
+                        vec,
+                        lane,
+                        src,
+                        zero,
+                    } => {
+                        let base = scratch.addr(*vec)?;
+                        let dst_slot = base + *lane as usize;
+                        let a = scratch.addr(*src)?;
+                        let z = scratch.addr(*zero)?;
+                        b.alu.push(Slot::Alu("+", dst_slot, a, z));
+                    }
+                    InstrKind::VectorLaneLoad {
+                        dst,
+                        vec,
+                        lane,
+                        zero,
+                    } => {
+                        let base = scratch.addr(*vec)?;
+                        let src_lane = base + *lane as usize;
+                        let d = scratch.addr(*dst)?;
+                        let z = scratch.addr(*zero)?;
+                        b.alu.push(Slot::Alu("+", d, src_lane, z));
+                    }
+                    InstrKind::Alu(ai) => b.alu.push(lower_alu(ai, &scratch)?),
+                    InstrKind::Valu(vi) => b.valu.push(lower_valu(vi, &scratch)?),
+                    InstrKind::Flow(fi) => b.flow.push(lower_flow(fi, &scratch)?),
+                    InstrKind::Load(li) => b.load.push(lower_load(li, &scratch)?),
+                    InstrKind::Store(si) => b.store.push(lower_store(si, &scratch)?),
+                    InstrKind::DebugCompare {
+                        value,
+                        round,
+                        batch,
+                        tag,
+                    } => {
+                        let a = scratch.addr(*value)?;
+                        b.debug.push(Slot::DebugCompare(a, *round, *batch, *tag));
+                    }
                 }
             }
+            b.assert_valid()?;
             bundles.push(b);
         }
         bundles.extend(lower_terminator(&block.terminator, &scratch, &block_pc)?);
@@ -396,25 +626,38 @@ impl ScratchLayout {
 fn build_greedy_scratch_layout(
     func: &Function,
     use_counts: &HashMap<RegisterId, usize>,
-    emitted: &HashSet<crate::vlir::InstrId>,
+    scheduled_blocks: &[ScheduledBlock],
 ) -> Result<ScratchLayout, LoweringError> {
     let mut map = HashMap::new();
     let mut allocs: HashMap<RegisterId, (usize, usize)> = HashMap::new();
     let mut remaining_uses = use_counts.clone();
     let mut used = vec![false; MACHINE_SCRATCH_SIZE];
 
+    let mut inst_by_id: HashMap<crate::vlir::InstrId, &crate::vlir::Instruction> = HashMap::new();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if !emitted.contains(&inst.id) {
-                continue;
-            }
-            for r in uses_in_instruction(inst) {
-                ensure_allocated(func, r, &mut allocs, &mut map, &mut used)?;
-                decrement_and_maybe_free(r, &mut remaining_uses, &mut allocs, &mut used);
-            }
+            inst_by_id.insert(inst.id, inst);
+        }
+    }
 
-            if let Some(dst) = def_of_instruction(inst) {
-                ensure_allocated(func, dst, &mut allocs, &mut map, &mut used)?;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for cycle in &scheduled_blocks[bi] {
+            let mut cycle_uses: Vec<RegisterId> = Vec::new();
+            for iid in cycle {
+                let inst = inst_by_id[iid];
+                for r in uses_in_instruction(inst) {
+                    ensure_allocated(func, r, &mut allocs, &mut map, &mut used)?;
+                    cycle_uses.push(r);
+                }
+
+                if let Some(dst) = def_of_instruction(inst) {
+                    ensure_allocated(func, dst, &mut allocs, &mut map, &mut used)?;
+                }
+            }
+            // Important: all reads in a VLIW bundle happen before any writes become visible.
+            // Defer use-count decrements/frees until the whole cycle has been allocated.
+            for r in cycle_uses {
+                decrement_and_maybe_free(r, &mut remaining_uses, &mut allocs, &mut used);
             }
         }
         for r in uses_in_terminator(&block.terminator) {
@@ -502,20 +745,26 @@ fn release_range(used: &mut [bool], base: usize, width: usize) {
 
 fn collect_use_counts(
     func: &Function,
-    emitted: &HashSet<crate::vlir::InstrId>,
+    scheduled_blocks: &[ScheduledBlock],
 ) -> HashMap<RegisterId, usize> {
     let mut uses = HashMap::new();
+    let mut inst_by_id: HashMap<crate::vlir::InstrId, &crate::vlir::Instruction> = HashMap::new();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if !emitted.contains(&inst.id) {
-                continue;
-            }
-            for r in uses_in_instruction(inst) {
-                *uses.entry(r).or_insert(0) += 1;
+            inst_by_id.insert(inst.id, inst);
+        }
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for cycle in &scheduled_blocks[bi] {
+            for iid in cycle {
+                let inst = inst_by_id[iid];
+                for r in uses_in_instruction(inst) {
+                    *uses.entry(r).or_insert(0) += 1;
+                }
             }
         }
         for r in uses_in_terminator(&block.terminator) {
-            *uses.entry(r).or_insert(0) += 1;
+                *uses.entry(r).or_insert(0) += 1;
         }
     }
     uses
@@ -560,6 +809,7 @@ fn is_side_effect_instruction(inst: &crate::vlir::Instruction) -> bool {
             | InstrKind::VectorLaneStore { .. }
             | InstrKind::DebugCompare { .. }
             | InstrKind::Flow(FlowInst::Pause)
+            | InstrKind::Flow(FlowInst::Sync)
     )
 }
 
@@ -582,7 +832,7 @@ fn def_of_instruction(inst: &crate::vlir::Instruction) -> Option<RegisterId> {
         InstrKind::Flow(FlowInst::Select { dst, .. })
         | InstrKind::Flow(FlowInst::VSelect { dst, .. })
         | InstrKind::Flow(FlowInst::AddImm { dst, .. }) => Some(*dst),
-        InstrKind::Flow(FlowInst::Pause) => None,
+        InstrKind::Flow(FlowInst::Pause) | InstrKind::Flow(FlowInst::Sync) => None,
         InstrKind::Load(li) => Some(li.dst),
         InstrKind::Store(_) => None,
         InstrKind::DebugCompare { .. } => None,
@@ -614,7 +864,7 @@ fn uses_in_instruction(inst: &crate::vlir::Instruction) -> Vec<RegisterId> {
         InstrKind::Flow(FlowInst::Select { cond, a, b, .. })
         | InstrKind::Flow(FlowInst::VSelect { cond, a, b, .. }) => vec![*cond, *a, *b],
         InstrKind::Flow(FlowInst::AddImm { a, .. }) => vec![*a],
-        InstrKind::Flow(FlowInst::Pause) => Vec::new(),
+        InstrKind::Flow(FlowInst::Pause) | InstrKind::Flow(FlowInst::Sync) => Vec::new(),
         InstrKind::Load(li) => vec![li.base_ptr],
         InstrKind::Store(si) => vec![si.base_ptr, si.src],
         InstrKind::DebugCompare { value, .. } => vec![*value],
@@ -705,6 +955,7 @@ fn lower_flow(inst: &FlowInst, layout: &ScratchLayout) -> Result<Slot, LoweringE
             Ok(Slot::FlowAddImm(layout.addr(*dst)?, layout.addr(*a)?, *imm))
         }
         FlowInst::Pause => Ok(Slot::Pause),
+        FlowInst::Sync => Ok(Slot::Sync),
     }
 }
 

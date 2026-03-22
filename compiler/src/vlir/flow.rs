@@ -21,6 +21,9 @@ pub enum FlowInst {
     },
     /// Pauses the core (`problem.Machine` `enable_pause`); matches reference kernel yields.
     Pause,
+    /// Scheduling barrier / no-op flow op.
+    /// Lowers to `("sync",)` and acts as a full issue boundary.
+    Sync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -344,7 +344,8 @@ impl FuncLowering {
         decl_ty: ValueType,
     ) -> Result<(), AstLoweringError> {
         let name = declarator_name(&d.declarator)?;
-        let ty = if declarator_type(&d.declarator) == ValueType::Vector || decl_ty == ValueType::Vector
+        let ty = if declarator_type(&d.declarator) == ValueType::Vector
+            || decl_ty == ValueType::Vector
         {
             ValueType::Vector
         } else {
@@ -635,6 +636,13 @@ impl FuncLowering {
                 self.emit(InstrKind::Flow(FlowInst::Pause), UnitClass::LoadStore);
                 Ok(self.zero_reg())
             }
+            "sync" => {
+                if !c.node.arguments.is_empty() {
+                    return Err(AstLoweringError::Unsupported("sync() takes no arguments"));
+                }
+                self.emit(InstrKind::Flow(FlowInst::Sync), UnitClass::LoadStore);
+                Ok(self.zero_reg())
+            }
             _ => Err(AstLoweringError::Unsupported("call target")),
         }
     }
@@ -723,8 +731,14 @@ impl FuncLowering {
 
         let mut merged = HashMap::new();
         for name in names {
-            let r_then = post_then.get(&name).copied().or_else(|| pre.get(&name).copied());
-            let r_else = post_else.get(&name).copied().or_else(|| pre.get(&name).copied());
+            let r_then = post_then
+                .get(&name)
+                .copied()
+                .or_else(|| pre.get(&name).copied());
+            let r_else = post_else
+                .get(&name)
+                .copied()
+                .or_else(|| pre.get(&name).copied());
             let (Some(a), Some(b)) = (r_then, r_else) else {
                 continue;
             };
@@ -743,23 +757,13 @@ impl FuncLowering {
             match ty_a {
                 ValueType::Vector => {
                     self.emit(
-                        InstrKind::Flow(FlowInst::VSelect {
-                            dst,
-                            cond,
-                            a,
-                            b,
-                        }),
+                        InstrKind::Flow(FlowInst::VSelect { dst, cond, a, b }),
                         UnitClass::LoadStore,
                     );
                 }
                 _ => {
                     self.emit(
-                        InstrKind::Flow(FlowInst::Select {
-                            dst,
-                            cond,
-                            a,
-                            b,
-                        }),
+                        InstrKind::Flow(FlowInst::Select { dst, cond, a, b }),
                         UnitClass::LoadStore,
                     );
                 }
@@ -865,7 +869,7 @@ fn assign_to_base_op(op: BinaryOperator) -> BinaryOperator {
         BinaryOperator::AssignBitwiseXor => BinaryOperator::BitwiseXor,
         BinaryOperator::AssignShiftLeft => BinaryOperator::ShiftLeft,
         BinaryOperator::AssignShiftRight => BinaryOperator::ShiftRight,
-        _ => op,
+        _ => panic!("Unsupported operator: {:?}", op),
     }
 }
 
@@ -883,7 +887,7 @@ fn map_alu_op(op: BinaryOperator) -> AluOp {
         BinaryOperator::ShiftRight => AluOp::Shr,
         BinaryOperator::Equals => AluOp::CmpEq,
         BinaryOperator::Less => AluOp::CmpLt,
-        _ => AluOp::Add,
+        _ => panic!("Unsupported operator: {:?}", op),
     }
 }
 
@@ -901,7 +905,7 @@ fn map_valu_op(op: BinaryOperator) -> ValuOp {
         BinaryOperator::ShiftRight => ValuOp::Shr,
         BinaryOperator::Equals => ValuOp::CmpEq,
         BinaryOperator::Less => ValuOp::CmpLt,
-        _ => ValuOp::Add,
+        _ => panic!("Unsupported operator: {:?}", op),
     }
 }
 
@@ -919,6 +923,6 @@ fn op_text_to_bin(s: &str) -> BinaryOperator {
         ">>" => BinaryOperator::ShiftRight,
         "==" => BinaryOperator::Equals,
         "<" => BinaryOperator::Less,
-        _ => BinaryOperator::Plus,
+        _ => panic!("Unsupported operator: {}", s),
     }
 }

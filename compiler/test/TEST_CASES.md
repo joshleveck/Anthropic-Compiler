@@ -45,6 +45,11 @@ Compiler JSON output shape (for `load_from_rust.load_kernel_from_rust`):
 | `t15_wrap_at_forest_height.c` | **`idx = vbroadcast(0)` when `r == FOREST_HEIGHT`** |
 | `t16_vselect_idx_minus_one.c` | **Sample `r==1` path**: `t = idx-1`, `vselect(t, vtwo, vone)` |
 | `t17_flow_pause.c` | **`flow_pause()`** → `("flow", ("pause",))` for trace alignment with reference yields |
+| `t18_opposite_runtime_if.c` | Runtime scalar `if` branch opposite direction (`rounds == 0`) |
+| `t19_scheduler_pack_independent_alu.c` | Scheduler packs independent scalar ALU ops into one bundle |
+| `t20_scheduler_store_load_order.c` | Scheduler preserves store→load ordering on same address |
+| `t21_scheduler_debug_after_producer.c` | Scheduler keeps `debug` compare after producing instruction |
+| `t22_sync_barrier.c` | `sync()` emits `("flow",("sync",))` and enforces scheduling barrier |
 
 ## Coverage vs `sample.c`
 

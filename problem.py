@@ -329,6 +329,9 @@ class Machine:
             case ("pause",):
                 if self.enable_pause:
                     core.state = CoreState.PAUSED
+            case ("sync",):
+                # Explicit no-op flow barrier used by the compiler scheduler.
+                pass
             case ("trace_write", val):
                 core.trace_buf.append(core.scratch[val])
             case ("cond_jump", cond, addr):

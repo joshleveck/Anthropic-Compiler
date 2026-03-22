@@ -11,7 +11,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from problem import Machine, VLEN, myhash
 from load_from_rust import load_kernel_from_rust
@@ -61,7 +61,9 @@ def compile_c_to_json(c_path: Path, json_path: Path) -> None:
     )
 
 
-def run_program(mem: list[int], program_json: Path, max_cycles: int = 500_000) -> list[int]:
+def run_program(
+    mem: list[int], program_json: Path, max_cycles: int = 500_000
+) -> list[int]:
     """Run the kernel; return final memory.
 
     `problem.Machine` copies `mem_dump`, so writes are only visible on the returned list.
@@ -75,6 +77,25 @@ def run_program(mem: list[int], program_json: Path, max_cycles: int = 500_000) -
     )
     m.run(max_cycles=max_cycles)
     return m.mem
+
+
+def max_engine_slots(
+    instrs: list[dict[str, list[tuple[Any, ...]]]], engine: str
+) -> int:
+    return max((len(b.get(engine, [])) for b in instrs), default=0)
+
+
+def print_bundle_metrics(c_file_name: str) -> None:
+    c_file = TEST_DIR / c_file_name
+    compile_c_to_json(c_file, OUT_JSON)
+    kernel = load_kernel_from_rust(OUT_JSON)
+    instrs = kernel.instrs
+    packed = sum(1 for b in instrs if sum(len(v) for v in b.values()) > 1)
+    print(
+        f"[metrics] {c_file_name}: bundles={len(instrs)} packed_bundles={packed} "
+        f"max_alu={max_engine_slots(instrs, 'alu')} max_load={max_engine_slots(instrs, 'load')} "
+        f"max_store={max_engine_slots(instrs, 'store')} max_valu={max_engine_slots(instrs, 'valu')}"
+    )
 
 
 # --- Reference simulations -------------------------------------------------
@@ -365,6 +386,73 @@ def case_t16() -> None:
     assert_mem_slice(final, val_ptr, exp, "t16 vselect idx-1")
 
 
+def case_t18() -> None:
+    data_ptr = 200
+    for rounds, add in [(0, 111), (3, 222)]:
+        mem = [0] * 2048
+        mem[P_ROUNDS] = rounds
+        mem[P_INP_VALUES_P] = data_ptr
+        mem[data_ptr] = 55
+        final = run_program(mem, OUT_JSON)
+        assert final[data_ptr] == u32(55 + add), (rounds, final[data_ptr])
+
+
+def case_t19() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    mem[data_ptr] = 7
+    mem[data_ptr + 1] = 11
+    kernel = load_kernel_from_rust(OUT_JSON)
+    assert max_engine_slots(kernel.instrs, "alu") >= 2, "t19 expected ALU slot packing"
+    final = run_program(mem, OUT_JSON)
+    assert final[data_ptr] == u32(17), final[data_ptr]
+    assert final[data_ptr + 1] == u32(31), final[data_ptr + 1]
+
+
+def case_t20() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    mem[data_ptr] = 77
+    final = run_program(mem, OUT_JSON)
+    assert final[data_ptr] == u32(82), final[data_ptr]
+    assert final[data_ptr + 1] == u32(82), final[data_ptr + 1]
+
+
+def case_t21() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    mem[data_ptr] = 41
+    kernel = load_kernel_from_rust(OUT_JSON)
+    m = Machine(
+        mem_dump=list(mem),
+        program=kernel.instrs,
+        debug_info=kernel.debug_info(),
+        trace=False,
+        value_trace={(0, 0, "val"): u32(42)},
+    )
+    m.run(max_cycles=100_000)
+    assert m.mem[data_ptr] == u32(42), m.mem[data_ptr]
+
+
+def case_t22() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    mem[data_ptr] = 10
+    mem[data_ptr + 1] = 20
+    kernel = load_kernel_from_rust(OUT_JSON)
+    # sync() should materialize as flow sync slot.
+    assert any(
+        any(slot[0] == "sync" for slot in b.get("flow", [])) for b in kernel.instrs
+    ), "t22 expected flow sync in emitted program"
+    final = run_program(mem, OUT_JSON)
+    assert final[data_ptr] == u32(11), final[data_ptr]
+    assert final[data_ptr + 1] == u32(22), final[data_ptr + 1]
+
+
 CASES: dict[str, Callable[[], None]] = {
     "t01_scalar_load_store": case_t01,
     "t02_vector_load_store": case_t02,
@@ -382,6 +470,11 @@ CASES: dict[str, Callable[[], None]] = {
     "t14_nested_batch_round": case_t14,
     "t15_wrap_at_forest_height": case_t15,
     "t16_vselect_idx_minus_one": case_t16,
+    "t18_opposite_runtime_if": case_t18,
+    "t19_scheduler_pack_independent_alu": case_t19,
+    "t20_scheduler_store_load_order": case_t20,
+    "t21_scheduler_debug_after_producer": case_t21,
+    "t22_sync_barrier": case_t22,
 }
 
 
@@ -406,6 +499,8 @@ def main() -> int:
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
+    print_bundle_metrics("t09_small_end_to_end.c")
+    # print_bundle_metrics("sample_scalar_reference.c")
     print("\nAll compiler harness tests passed.")
     return 0
 
