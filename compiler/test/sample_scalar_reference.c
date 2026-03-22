@@ -23,6 +23,10 @@ uint32_t *p_n_nodes = (uint32_t *)1;
 const uint32_t ROUNDS = 16;
 const uint32_t BATCH_SIZE = 256;
 
+const uint32_t ZERO = 0;
+const uint32_t ONE = 1;
+const uint32_t TWO = 2;
+
 void kernel()
 {
     uint32_t n_nodes = load(p_n_nodes);
@@ -44,16 +48,7 @@ void kernel()
             debug(node_val, h, i, 2);
             val = myhash(val ^ node_val);
             debug(val, h, i, 3);
-            uint32_t inc;
-            if (val % 2 == 0)
-            {
-                inc = 1;
-            }
-            else
-            {
-                inc = 2;
-            }
-            uint32_t next_idx = 2 * idx + inc;
+            uint32_t next_idx = TWO * idx + val % TWO + ONE;
             debug(next_idx, h, i, 4);
 
             if (next_idx < n_nodes)
@@ -62,7 +57,7 @@ void kernel()
             }
             else
             {
-                idx = 0;
+                idx = ZERO;
             }
             debug(idx, h, i, 5);
         }
