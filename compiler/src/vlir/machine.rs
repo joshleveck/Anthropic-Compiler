@@ -328,6 +328,7 @@ fn def_regs(inst: &crate::vlir::Instruction) -> Vec<RegisterId> {
     match &inst.kind {
         // Partial vector write is still a write dependency for scheduling.
         InstrKind::VectorLaneStore { vec, .. } => vec![*vec],
+        InstrKind::Load(li) if li.vector_gather => vec![li.dst],
         _ => match def_of_instruction(inst) {
             Some(r) => vec![r],
             None => Vec::new(),
@@ -677,6 +678,10 @@ fn build_greedy_scratch_layout(
 
                 if let Some(dst) = def_of_instruction(inst) {
                     ensure_allocated(func, dst, &mut allocs, &mut map, &mut used)?;
+                } else {
+                    for r in def_regs(inst) {
+                        ensure_allocated(func, r, &mut allocs, &mut map, &mut used)?;
+                    }
                 }
             }
             // Important: all reads in a VLIW bundle happen before any writes become visible.
@@ -828,14 +833,15 @@ fn build_emission_plan(func: &Function) -> HashSet<crate::vlir::InstrId> {
 }
 
 fn is_side_effect_instruction(inst: &crate::vlir::Instruction) -> bool {
-    matches!(
-        inst.kind,
+    match &inst.kind {
+        InstrKind::Load(li) if li.vector_gather => true,
         InstrKind::Store(_)
-            | InstrKind::VectorLaneStore { .. }
-            | InstrKind::DebugCompare { .. }
-            | InstrKind::Flow(FlowInst::Pause)
-            | InstrKind::Flow(FlowInst::Sync)
-    )
+        | InstrKind::VectorLaneStore { .. }
+        | InstrKind::DebugCompare { .. }
+        | InstrKind::Flow(FlowInst::Pause)
+        | InstrKind::Flow(FlowInst::Sync) => true,
+        _ => false,
+    }
 }
 
 fn reg_width(func: &Function, reg: RegisterId) -> Result<usize, LoweringError> {
@@ -858,7 +864,13 @@ fn def_of_instruction(inst: &crate::vlir::Instruction) -> Option<RegisterId> {
         | InstrKind::Flow(FlowInst::VSelect { dst, .. })
         | InstrKind::Flow(FlowInst::AddImm { dst, .. }) => Some(*dst),
         InstrKind::Flow(FlowInst::Pause) | InstrKind::Flow(FlowInst::Sync) => None,
-        InstrKind::Load(li) => Some(li.dst),
+        InstrKind::Load(li) => {
+            if li.vector_gather {
+                None
+            } else {
+                Some(li.dst)
+            }
+        }
         InstrKind::Store(_) => None,
         InstrKind::DebugCompare { .. } => None,
     }

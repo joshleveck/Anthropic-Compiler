@@ -485,6 +485,24 @@ def case_t24() -> None:
     assert_mem_slice(final, data_ptr, exp, "t24 a*b+c+d fused to multiply_add")
 
 
+def case_t25() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    base = 300
+    for i in range(VLEN):
+        mem[data_ptr + i] = u32(base + i)
+        mem[base + i] = u32(100 + i)
+    kernel = load_kernel_from_rust(OUT_JSON)
+    assert any(
+        any(slot[0] == "load_offset" for slot in b.get("load", []))
+        for b in kernel.instrs
+    ), "t25 expected load_offset vector gather fusion"
+    final = run_program(mem, OUT_JSON)
+    exp = [u32(100 + i) for i in range(VLEN)]
+    assert_mem_slice(final, data_ptr, exp, "t25 dst[lane]=load(addr[lane])")
+
+
 CASES: dict[str, Callable[[], None]] = {
     "t01_scalar_load_store": case_t01,
     "t02_vector_load_store": case_t02,
@@ -509,6 +527,7 @@ CASES: dict[str, Callable[[], None]] = {
     "t22_sync_barrier": case_t22,
     "t23_vector_multiply_add": case_t23,
     "t24_vector_multiply_add_add": case_t24,
+    "t25_load_offset_gather": case_t25,
 }
 
 

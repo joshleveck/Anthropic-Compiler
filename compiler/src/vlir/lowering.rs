@@ -417,6 +417,9 @@ impl FuncLowering {
         use BinaryOperator::*;
         match b.operator.node {
             Assign => {
+                if let Some(out) = self.try_emit_load_offset_gather_assign(&b.lhs.node, &b.rhs.node)? {
+                    return Ok(out);
+                }
                 let rhs = self.lower_expr(&b.rhs.node)?;
                 self.assign_lvalue(&b.lhs.node, rhs)?;
                 Ok(rhs)
@@ -535,6 +538,7 @@ impl FuncLowering {
                         dst,
                         base_ptr: addr,
                         offset: 0,
+                        vector_gather: false,
                     }),
                     UnitClass::LoadStore,
                 );
@@ -549,6 +553,7 @@ impl FuncLowering {
                         dst,
                         base_ptr: addr,
                         offset: 0,
+                        vector_gather: false,
                     }),
                     UnitClass::LoadStore,
                 );
@@ -687,6 +692,88 @@ impl FuncLowering {
             }
             _ => Err(AstLoweringError::Unsupported("call target")),
         }
+    }
+
+    /// `dst_vec[lane] = load(addr_vec[lane])` with the same compile-time `lane` → one `load_offset`
+    /// (plus `VectorLaneLoad` for the value of the assignment expression).
+    fn try_emit_load_offset_gather_assign(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+    ) -> Result<Option<RegisterId>, AstLoweringError> {
+        use BinaryOperator::Index;
+        let lhs_idx = match lhs {
+            Expression::BinaryOperator(b) if matches!(b.node.operator.node, Index) => b,
+            _ => return Ok(None),
+        };
+        let dst_name = match &lhs_idx.node.lhs.node {
+            Expression::Identifier(id) => id.node.name.clone(),
+            _ => return Ok(None),
+        };
+        let lane = match try_compile_time_lane_index(&lhs_idx.node.rhs.node) {
+            Some(l) if (0..8).contains(&l) => l,
+            _ => return Ok(None),
+        };
+        let dst_vec = self.lookup(&dst_name)?;
+        if self.reg_ty(dst_vec) != ValueType::Vector {
+            return Ok(None);
+        }
+
+        let call = match rhs {
+            Expression::Call(c) => c,
+            _ => return Ok(None),
+        };
+        match &call.node.callee.node {
+            Expression::Identifier(id) if id.node.name == "load" => {}
+            _ => return Ok(None),
+        }
+        if call.node.arguments.len() != 1 {
+            return Err(AstLoweringError::Unsupported("load() arity"));
+        }
+        let arg0 = &call.node.arguments[0].node;
+        let addr_idx = match arg0 {
+            Expression::BinaryOperator(b) if matches!(b.node.operator.node, Index) => b,
+            _ => return Ok(None),
+        };
+        let addr_name = match &addr_idx.node.lhs.node {
+            Expression::Identifier(id) => id.node.name.clone(),
+            _ => return Ok(None),
+        };
+        let lane2 = match try_compile_time_lane_index(&addr_idx.node.rhs.node) {
+            Some(l) if (0..8).contains(&l) => l,
+            _ => return Ok(None),
+        };
+        if lane != lane2 {
+            return Ok(None);
+        }
+        let addr_vec = self.lookup(&addr_name)?;
+        if self.reg_ty(addr_vec) != ValueType::Vector {
+            return Ok(None);
+        }
+
+        self.emit(
+            InstrKind::Load(LoadInst {
+                kind: LoadKind::I32,
+                dst: dst_vec,
+                base_ptr: addr_vec,
+                offset: lane,
+                vector_gather: true,
+            }),
+            UnitClass::LoadStore,
+        );
+
+        let z = self.zero_reg();
+        let scalar_out = self.new_temp(ValueType::Scalar);
+        self.emit(
+            InstrKind::VectorLaneLoad {
+                dst: scalar_out,
+                vec: dst_vec,
+                lane: lane as u8,
+                zero: z,
+            },
+            UnitClass::ScalarAlu,
+        );
+        Ok(Some(scalar_out))
     }
 
     fn lookup(&self, name: &str) -> Result<RegisterId, AstLoweringError> {
