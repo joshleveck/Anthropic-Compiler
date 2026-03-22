@@ -32,14 +32,14 @@ void kernel()
 
     flow_pause();
 
-    for (uint32_t h = 0; h < ROUNDS; h++)
+    for (uint32_t i = 0; i < BATCH_SIZE; i++)
     {
-        for (uint32_t i = 0; i < BATCH_SIZE; i++)
+        uint32_t idx = load(inp_indices_p + i);
+        uint32_t val = load(inp_values_p + i);
+        for (uint32_t h = 0; h < ROUNDS; h++)
         {
-            uint32_t idx = load(inp_indices_p + i);
-            debug(idx, h, i, 0);
-            uint32_t val = load(inp_values_p + i);
             debug(val, h, i, 1);
+            debug(idx, h, i, 0);
             uint32_t node_val = load(forest_values_p + idx);
             debug(node_val, h, i, 2);
             val = myhash(val ^ node_val);
@@ -55,19 +55,20 @@ void kernel()
             }
             uint32_t next_idx = 2 * idx + inc;
             debug(next_idx, h, i, 4);
-            uint32_t wrapped_idx;
+
             if (next_idx < n_nodes)
             {
-                wrapped_idx = next_idx;
+                idx = next_idx;
             }
             else
             {
-                wrapped_idx = 0;
+                idx = 0;
             }
-            debug(wrapped_idx, h, i, 5);
-            store(inp_values_p + i, val);
-            store(inp_indices_p + i, wrapped_idx);
+            debug(idx, h, i, 5);
         }
+
+        store(inp_values_p + i, val);
+        store(inp_indices_p + i, idx);
     }
 
     flow_pause();

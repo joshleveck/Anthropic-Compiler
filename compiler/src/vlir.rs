@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use alu::AluInst;
 use flow::{FlowInst, Terminator};
 use load::LoadInst;
-use machine::{InstructionBundle, LoweringError, MachineProgram};
+use machine::{InstructionBundle, LoweringError, MachineProgram, ScratchDebugMap};
 use store::StoreInst;
 use valu::ValuInst;
 
@@ -100,6 +100,8 @@ pub struct Function {
     pub entry: BlockId,
     pub blocks: Vec<BasicBlock>,
     pub reg_types: HashMap<RegisterId, ValueType>,
+    /// Optional display names for scratch allocation (see `Machine` / `DebugInfo.scratch_map`).
+    pub reg_names: HashMap<RegisterId, String>,
     next_reg: u32,
     next_instr: u32,
     next_block: u32,
@@ -117,6 +119,7 @@ impl Function {
                 terminator: Terminator::Unreachable,
             }],
             reg_types: HashMap::new(),
+            reg_names: HashMap::new(),
             next_reg: 0,
             next_instr: 0,
             next_block: 1,
@@ -127,7 +130,19 @@ impl Function {
         let id = RegisterId(self.next_reg);
         self.next_reg += 1;
         self.reg_types.insert(id, ty);
+        self.reg_names.insert(id, format!("r{}", id.0));
         id
+    }
+
+    pub fn set_reg_name(&mut self, reg: RegisterId, name: String) {
+        self.reg_names.insert(reg, name);
+    }
+
+    pub fn reg_display_name(&self, reg: RegisterId) -> String {
+        self.reg_names
+            .get(&reg)
+            .cloned()
+            .unwrap_or_else(|| format!("r{}", reg.0))
     }
 
     pub fn new_block(&mut self) -> BlockId {
@@ -167,7 +182,7 @@ impl Function {
         }
     }
 
-    pub fn lower_to_machine(&self) -> Result<MachineProgram, LoweringError> {
+    pub fn lower_to_machine(&self) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
         machine::lower_function(self)
     }
 }
@@ -178,7 +193,7 @@ pub struct Program {
 }
 
 impl Program {
-    pub fn lower_to_machine(&self) -> Result<Vec<MachineProgram>, LoweringError> {
+    pub fn lower_to_machine(&self) -> Result<Vec<(MachineProgram, ScratchDebugMap)>, LoweringError> {
         self.functions
             .iter()
             .map(Function::lower_to_machine)
@@ -189,7 +204,7 @@ impl Program {
         let lowered = self.lower_to_machine()?;
         Ok(lowered
             .iter()
-            .map(InstructionBundle::program_to_python_list_literal)
+            .map(|(p, _)| InstructionBundle::program_to_python_list_literal(p))
             .collect())
     }
 }

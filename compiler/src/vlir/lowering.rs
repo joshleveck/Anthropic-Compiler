@@ -49,6 +49,7 @@ fn lower_function_definition(
     for (name, value) in globals {
         let r = cx.emit_const(*value);
         cx.vars.insert(name.clone(), r);
+        cx.func.set_reg_name(r, name.clone());
     }
     let body = loop_unroll::unroll_statement(&def.statement.node, globals);
     cx.lower_statement(&body)?;
@@ -344,7 +345,10 @@ impl FuncLowering {
                 lang_c::ast::Initializer::Expression(e) => self.lower_expr(&e.node)?,
                 _ => return Err(AstLoweringError::Unsupported("non-expression initializer")),
             };
-            self.vars.insert(name, rhs);
+            self.vars.insert(name.clone(), rhs);
+            self.func.set_reg_name(rhs, name);
+        } else {
+            self.func.set_reg_name(reg, name);
         }
         Ok(())
     }

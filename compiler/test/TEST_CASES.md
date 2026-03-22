@@ -16,6 +16,14 @@ Or compile one file:
 cd compiler && cargo run --quiet -- test/t10_vector_mod2.c output/t.json
 ```
 
+Compiler JSON output shape (for `load_from_rust.load_kernel_from_rust`):
+
+```json
+{"instructions":[{...bundles...}],"debug_info":{"scratch_map":{"0":["name",1]}}}
+```
+
+`scratch_map` keys are base scratch addresses (words); values are `[symbol_name, length_in_words]` like `problem.DebugInfo`. A legacy top-level JSON array of bundles is still accepted.
+
 ## Files
 
 | File | What it stresses |

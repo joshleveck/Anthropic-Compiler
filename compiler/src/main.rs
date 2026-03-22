@@ -11,6 +11,7 @@ fn print_usage() {
     eprintln!("usage: compiler <input.c> [output.json]");
     eprintln!("  Compiles the first `kernel()` in the translation unit to VLIW JSON.");
     eprintln!("  If output.json is omitted, writes to output/compiled_<unix_time>.json");
+    eprintln!("  JSON: {{ instructions: [ bundles ], debug_info: {{ scratch_map: {{ addr: [name, len] }} }} }}.");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,11 +50,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let Some(first) = machine_programs.first() else {
+    let Some((prog, scratch_debug)) = machine_programs.first() else {
         return Err("no machine program produced (missing kernel()?)".into());
     };
 
-    let json = vlir::machine::InstructionBundle::program_to_json(first);
+    let json =
+        vlir::machine::InstructionBundle::program_to_json_with_debug(prog, scratch_debug);
     if let Some(parent) = Path::new(&out_path).parent() {
         fs::create_dir_all(parent)?;
     }

@@ -106,6 +106,18 @@ fn debug_tag_str(tag: u8) -> &'static str {
     }
 }
 
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct InstructionBundle {
     pub alu: Vec<Slot>,
@@ -199,6 +211,26 @@ impl InstructionBundle {
         format!("[{}]", body)
     }
 
+    /// Full compiler output: instruction bundles plus `debug_info.scratch_map` for `problem.DebugInfo`.
+    pub fn program_to_json_with_debug(program: &MachineProgram, scratch_map: &ScratchDebugMap) -> String {
+        let instr = Self::program_to_json(program);
+        let mut keys: Vec<usize> = scratch_map.keys().copied().collect();
+        keys.sort_unstable();
+        let entries: Vec<String> = keys
+            .into_iter()
+            .map(|k| {
+                let (name, len) = &scratch_map[&k];
+                let esc = escape_json_string(name);
+                format!(r#""{}":["{}",{}]"#, k, esc, len)
+            })
+            .collect();
+        let sm = entries.join(",");
+        format!(
+            r#"{{"instructions":{},"debug_info":{{"scratch_map":{{{}}}}}}}"#,
+            instr, sm
+        )
+    }
+
     pub fn assert_valid(&self) -> Result<(), LoweringError> {
         if self.alu.len() > 12 {
             return Err(LoweringError::SlotLimitExceeded(
@@ -248,6 +280,9 @@ impl InstructionBundle {
 
 pub type MachineProgram = Vec<InstructionBundle>;
 
+/// Base scratch word -> (symbolic name, length in 32-bit words). Matches `problem.DebugInfo.scratch_map`.
+pub type ScratchDebugMap = HashMap<usize, (String, usize)>;
+
 fn terminator_bundle_count(term: &Terminator) -> usize {
     // Must match `lower_terminator`: Branch uses two bundles (cond_jump, then jump)
     // because the simulator allows only one flow slot per cycle.
@@ -257,10 +292,21 @@ fn terminator_bundle_count(term: &Terminator) -> usize {
     }
 }
 
-pub fn lower_function(func: &Function) -> Result<MachineProgram, LoweringError> {
+fn build_scratch_debug_map(func: &Function, layout: &ScratchLayout) -> Result<ScratchDebugMap, LoweringError> {
+    let mut out = ScratchDebugMap::new();
+    for (&reg, &base) in &layout.map {
+        let w = reg_width(func, reg)?;
+        let name = func.reg_display_name(reg);
+        out.insert(base, (name, w));
+    }
+    Ok(out)
+}
+
+pub fn lower_function(func: &Function) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
     let emitted = build_emission_plan(func);
     let use_counts = collect_use_counts(func, &emitted);
     let scratch = build_greedy_scratch_layout(func, &use_counts, &emitted)?;
+    let scratch_debug = build_scratch_debug_map(func, &scratch)?;
 
     let mut block_pc = HashMap::new();
     let mut pc = 0usize;
@@ -330,7 +376,7 @@ pub fn lower_function(func: &Function) -> Result<MachineProgram, LoweringError> 
         }
         bundles.extend(lower_terminator(&block.terminator, &scratch, &block_pc)?);
     }
-    Ok(bundles)
+    Ok((bundles, scratch_debug))
 }
 
 #[derive(Default)]
