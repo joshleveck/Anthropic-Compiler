@@ -8,7 +8,7 @@ reference kernel for testing.
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 import random
 
 Engine = Literal["alu", "load", "store", "flow"]
@@ -194,7 +194,11 @@ class Machine:
                     f'{{"name": "thread_name", "ph": "M", "pid": {len(self.cores) + ci}, "tid": {BASE_ADDR_TID + addr}, "args": {{"name":"{name}-{length}"}}}},\n'
                 )
 
-    def run(self):
+    def run(self, max_cycles: Optional[int] = None):
+        """
+        Run until all cores stop. If max_cycles is set, raises RuntimeError when
+        the simulated cycle count (non-debug work only) exceeds that limit.
+        """
         for core in self.cores:
             if core.state == CoreState.PAUSED:
                 core.state = CoreState.RUNNING
@@ -215,6 +219,14 @@ class Machine:
                     has_non_debug = True
             if has_non_debug:
                 self.cycle += 1
+                if max_cycles is not None and self.cycle > max_cycles:
+                    raise RuntimeError(
+                        f"Machine exceeded max_cycles={max_cycles} (possible infinite loop)"
+                    )
+
+            if self.cycle % 147734 == 0:
+                # raise Exception("Cycle limit reached")
+                print("Cycle limit reached")
 
     def alu(self, core, op, dest, a1, a2):
         a1 = core.scratch[a1]
@@ -369,6 +381,9 @@ class Machine:
                 for slot in slots:
                     if slot[0] == "compare":
                         loc, key = slot[1], slot[2]
+                        # JSON may deserialize trace keys as lists; reference_kernel2 uses tuples.
+                        if isinstance(key, list):
+                            key = tuple(key)
                         ref = self.value_trace[key]
                         res = core.scratch[loc]
                         assert res == ref, f"{res} != {ref} for {key} at pc={core.pc}"

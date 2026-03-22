@@ -242,8 +242,8 @@ class KernelBuilder:
             vtmp_a.append(self.alloc_scratch(f"vtmp_a_{lane}", VLEN))
             vtmp_b.append(self.alloc_scratch(f"vtmp_b_{lane}", VLEN))
 
-        for batch in range(0, batch_size, VLEN * lanes):
-            lane_count = min(lanes, (batch_size - batch + VLEN - 1) // VLEN)
+        for batch in range(0, 1):
+            lane_count = 1  # min(lanes, (batch_size - batch + VLEN - 1) // VLEN)
             i_consts = [
                 self.scratch_const(batch + lane * VLEN) for lane in range(lane_count)
             ]
@@ -485,14 +485,20 @@ def do_kernel_test(
     trace: bool = False,
     prints: bool = False,
 ):
+    import load_from_rust
+
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
-    kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    kb = load_from_rust.load_latest_kernel_from_rust("compiler/output")
+
+    print("loaded kernel from rust")
+
+    # kb = KernelBuilder()
+    # kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
     value_trace = {}
