@@ -453,6 +453,38 @@ def case_t22() -> None:
     assert final[data_ptr + 1] == u32(22), final[data_ptr + 1]
 
 
+def case_t23() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    init = [u32(i + 1) for i in range(VLEN)]
+    mem[data_ptr : data_ptr + VLEN] = init
+    kernel = load_kernel_from_rust(OUT_JSON)
+    assert any(
+        any(slot[0] == "multiply_add" for slot in b.get("valu", []))
+        for b in kernel.instrs
+    ), "t23 expected fused multiply_add in emitted program"
+    final = run_program(mem, OUT_JSON)
+    exp = [u32((i + 1) * 2 + 10) for i in range(VLEN)]
+    assert_mem_slice(final, data_ptr, exp, "t23 a*b+c fused to multiply_add")
+
+
+def case_t24() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    init = [u32(i + 1) for i in range(VLEN)]
+    mem[data_ptr : data_ptr + VLEN] = init
+    kernel = load_kernel_from_rust(OUT_JSON)
+    assert any(
+        any(slot[0] == "multiply_add" for slot in b.get("valu", []))
+        for b in kernel.instrs
+    ), "t24 expected fused multiply_add in emitted program"
+    final = run_program(mem, OUT_JSON)
+    exp = [u32((i + 1) * 2 + 10 + 20) for i in range(VLEN)]
+    assert_mem_slice(final, data_ptr, exp, "t24 a*b+c+d fused to multiply_add")
+
+
 CASES: dict[str, Callable[[], None]] = {
     "t01_scalar_load_store": case_t01,
     "t02_vector_load_store": case_t02,
@@ -475,6 +507,8 @@ CASES: dict[str, Callable[[], None]] = {
     "t20_scheduler_store_load_order": case_t20,
     "t21_scheduler_debug_after_producer": case_t21,
     "t22_sync_barrier": case_t22,
+    "t23_vector_multiply_add": case_t23,
+    "t24_vector_multiply_add_add": case_t24,
 }
 
 

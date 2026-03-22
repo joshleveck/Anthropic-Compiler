@@ -461,6 +461,48 @@ impl FuncLowering {
                 Ok(dst)
             }
             _ => {
+                use BinaryOperator::{Multiply, Plus};
+                // Fuse `(a * b) + c` → `multiply_add` when a, b, c are all vectors (vec8).
+                // Matches C precedence: `a * b + c` parses as `(a * b) + c`.
+                if matches!(b.operator.node, Plus) {
+                    if let Expression::BinaryOperator(inner) = &b.lhs.node {
+                        if matches!(inner.node.operator.node, Multiply) {
+                            let a = self.lower_expr(&inner.node.lhs.node)?;
+                            let b_reg = self.lower_expr(&inner.node.rhs.node)?;
+                            let c = self.lower_expr(&b.rhs.node)?;
+                            if self.reg_ty(a) == ValueType::Vector
+                                && self.reg_ty(b_reg) == ValueType::Vector
+                                && self.reg_ty(c) == ValueType::Vector
+                            {
+                                let a = self.ensure_vector(a);
+                                let b_reg = self.ensure_vector(b_reg);
+                                let c = self.ensure_vector(c);
+                                let dst = self.new_temp(ValueType::Vector);
+                                self.emit(
+                                    InstrKind::Valu(ValuInst {
+                                        op: ValuOp::Mul,
+                                        dst,
+                                        src1: a,
+                                        src2: b_reg,
+                                        src3: Some(c),
+                                    }),
+                                    UnitClass::VectorAlu,
+                                );
+                                return Ok(dst);
+                            }
+                            let ty = if self.reg_ty(a) == ValueType::Vector
+                                || self.reg_ty(b_reg) == ValueType::Vector
+                                || self.reg_ty(c) == ValueType::Vector
+                            {
+                                ValueType::Vector
+                            } else {
+                                ValueType::Scalar
+                            };
+                            let prod = self.emit_binary(Multiply, a, b_reg, ty);
+                            return Ok(self.emit_binary(Plus, prod, c, ty));
+                        }
+                    }
+                }
                 let lhs = self.lower_expr(&b.lhs.node)?;
                 let rhs = self.lower_expr(&b.rhs.node)?;
                 let ty = if self.reg_ty(lhs) == ValueType::Vector
