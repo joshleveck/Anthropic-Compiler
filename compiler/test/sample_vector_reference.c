@@ -43,6 +43,9 @@ void kernel()
     const vec8_t VZERO = vbroadcast(ZERO);
     const vec8_t VONE = vbroadcast(ONE);
     const vec8_t VTWO = vbroadcast(TWO);
+    const vec8_t VFOREST_VALUES_P = vbroadcast(forest_values_p);
+
+    const uint32_t FOREST_ZERO_VALUE = load(forest_values_p);
 
     flow_pause(); // needed for reference kernel
 
@@ -58,14 +61,20 @@ void kernel()
         {
             uint32_t round_in_tree = h % (FOREST_HEIGHT + 1);
             uint32_t is_wrap_around_round = round_in_tree == FOREST_HEIGHT;
+            uint32_t is_zero_round = round_in_tree == 0;
 
-            // debug(val, h, i, 1);
-            // debug(idx, h, i, 0);
-            vec8_t forest_indicies = forest_values_p + idx;
-            vec8_t node_val;
-            for (int vi = 0; vi < VLEN; vi++)
+            if (is_zero_round)
             {
-                node_val[vi] = load(forest_indicies[vi]);
+                node_val = vbroadcast(FOREST_ZERO_VALUE);
+            }
+            else
+            {
+                vec8_t forest_indicies = VFOREST_VALUES_P + idx;
+                vec8_t node_val;
+                for (int vi = 0; vi < VLEN; vi++)
+                {
+                    node_val[vi] = load(forest_indicies[vi]);
+                }
             }
 
             // debug(node_val, h, i, 2);
@@ -85,7 +94,7 @@ void kernel()
 
         vstore(val_addr, val);
         vstore(idx_addr, idx);
-        sync();
+        // sync();
     }
 
     flow_pause();

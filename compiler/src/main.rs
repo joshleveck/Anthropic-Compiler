@@ -10,6 +10,7 @@ mod vlir;
 fn print_usage() {
     eprintln!("usage: compiler <input.c> [output.json] [options]");
     eprintln!("  Compiles the first `kernel()` in the translation unit to VLIW JSON.");
+    eprintln!("  Other top-level functions may appear as `spawn(..., name, ...)` targets.");
     eprintln!("  If output.json is omitted, writes to output/compiled_<unix_time>.json");
     eprintln!("  JSON: {{ instructions: [ bundles ], debug_info: {{ scratch_map: {{ addr: [name, len] }} }} }}.");
     eprintln!("options:");

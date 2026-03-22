@@ -52,6 +52,12 @@ Compiler JSON output shape (for `load_from_rust.load_kernel_from_rust`):
 | `t20_scheduler_store_load_order.c` | Scheduler preserves store→load ordering on same address |
 | `t21_scheduler_debug_after_producer.c` | Scheduler keeps `debug` compare after producing instruction |
 | `t22_sync_barrier.c` | `sync()` emits `("flow",("sync",))` and enforces scheduling barrier |
+| `t23_vector_multiply_add.c` | Fused `(a*b)+c` → `multiply_add` for vectors |
+| `t24_vector_multiply_add_add.c` | Chained multiply-add style fusion |
+| `t25_load_offset_gather.c` | `dst[lane]=load(addr[lane])` → `load_offset` |
+| `t26_spawn.c` | `spawn(B,T,fn,...)` inlines `fn` **B×T** times; `__builtin_*` grid indices |
+
+See also **`vector_lanes.c`**: `spawn` + `execute_rounds` with `__builtin_block_idx` / `__builtin_thread_idx` / `__builtin_block_dim`.
 
 ## Coverage vs `sample.c`
 

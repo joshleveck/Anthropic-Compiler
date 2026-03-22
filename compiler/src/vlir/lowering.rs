@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use lang_c::ast::{
     BinaryOperator, BlockItem, Constant, Declaration, DeclarationSpecifier, Declarator,
-    DeclaratorKind, Expression, ExternalDeclaration, ForInitializer, FunctionDefinition,
-    InitDeclarator, Statement, TranslationUnit, TypeSpecifier, UnaryOperator,
+    DeclaratorKind, DerivedDeclarator, Expression, ExternalDeclaration, ForInitializer,
+    FunctionDefinition, InitDeclarator, ParameterDeclaration, Statement, TranslationUnit,
+    TypeSpecifier, UnaryOperator,
 };
 use lang_c::span::Node;
 
@@ -28,24 +29,43 @@ pub enum AstLoweringError {
 
 pub fn lower_translation_unit(unit: &TranslationUnit) -> Result<Program, AstLoweringError> {
     let globals = collect_global_constants(unit)?;
+    let all_functions = collect_function_definitions(unit)?;
     let mut functions = Vec::new();
     for ext in &unit.0 {
         if let ExternalDeclaration::FunctionDefinition(def) = &ext.node {
             let name = declarator_name(&def.node.declarator)?;
             if name == "kernel" {
-                functions.push(lower_function_definition(&def.node, &globals)?);
+                functions.push(lower_function_definition(
+                    &def.node,
+                    &globals,
+                    all_functions.clone(),
+                )?);
             }
         }
     }
     Ok(Program { functions })
 }
 
+fn collect_function_definitions(
+    unit: &TranslationUnit,
+) -> Result<HashMap<String, Node<FunctionDefinition>>, AstLoweringError> {
+    let mut m = HashMap::new();
+    for ext in &unit.0 {
+        if let ExternalDeclaration::FunctionDefinition(def) = &ext.node {
+            let name = declarator_name(&def.node.declarator)?;
+            m.insert(name, def.clone());
+        }
+    }
+    Ok(m)
+}
+
 fn lower_function_definition(
     def: &FunctionDefinition,
     globals: &HashMap<String, i32>,
+    all_functions: HashMap<String, Node<FunctionDefinition>>,
 ) -> Result<Function, AstLoweringError> {
     let name = declarator_name(&def.declarator)?;
-    let mut cx = FuncLowering::new(Function::new(name));
+    let mut cx = FuncLowering::new(Function::new(name), globals.clone(), all_functions);
     for (name, value) in globals {
         let r = cx.emit_const(*value);
         cx.vars.insert(name.clone(), r);
@@ -58,6 +78,14 @@ fn lower_function_definition(
             .set_terminator(cx.current, Terminator::Return { value: None });
     }
     Ok(cx.func)
+}
+
+/// CUDA-like grid state while lowering a function body inlined from `spawn`.
+#[derive(Clone, Copy)]
+struct SpawnContext {
+    block_idx_reg: RegisterId,
+    thread_idx: i32,
+    block_dim: i32,
 }
 
 fn collect_global_constants(
@@ -86,21 +114,37 @@ struct FuncLowering {
     func: Function,
     vars: HashMap<String, RegisterId>,
     current: BlockId,
+    /// File-scope `const` values (for loop unroll and spawn child bodies).
+    globals: HashMap<String, i32>,
+    /// All function definitions in the translation unit (for `spawn` targets).
+    all_functions: HashMap<String, Node<FunctionDefinition>>,
+    /// Active while lowering a `spawn`-inlined body.
+    spawn_context: Option<SpawnContext>,
     /// Cached scalar 0 for vector lane copy (`+` with zero).
     zero_scalar: Option<RegisterId>,
-    /// One `const` register per immediate used by `myhash` / `vhash` (shared across all calls).
+    /// One scalar `const` register per immediate used by `myhash` / `vhash` (shared across all calls).
     hash_const_cache: HashMap<i32, RegisterId>,
+    /// One vbroadcast'd vector per immediate used only by `vhash` — avoids re-vbroadcasting each stage/call.
+    hash_const_vector_cache: HashMap<i32, RegisterId>,
 }
 
 impl FuncLowering {
-    fn new(func: Function) -> Self {
+    fn new(
+        func: Function,
+        globals: HashMap<String, i32>,
+        all_functions: HashMap<String, Node<FunctionDefinition>>,
+    ) -> Self {
         let current = func.entry;
         Self {
             func,
             vars: HashMap::new(),
             current,
+            globals,
+            all_functions,
+            spawn_context: None,
             zero_scalar: None,
             hash_const_cache: HashMap::new(),
+            hash_const_vector_cache: HashMap::new(),
         }
     }
 
@@ -112,6 +156,17 @@ impl FuncLowering {
         let r = self.emit_const(v);
         self.hash_const_cache.insert(v, r);
         r
+    }
+
+    /// Vector of `vbroadcast(v)` for `vhash` stages: one broadcast per distinct immediate per function.
+    fn hash_const_vector_reg(&mut self, v: i32) -> RegisterId {
+        if let Some(&r) = self.hash_const_vector_cache.get(&v) {
+            return r;
+        }
+        let s = self.hash_const_reg(v);
+        let vb = self.emit_vbroadcast(s);
+        self.hash_const_vector_cache.insert(v, vb);
+        vb
     }
 
     fn zero_reg(&mut self) -> RegisterId {
@@ -614,8 +669,8 @@ impl FuncLowering {
                     ("^", 0xB55A4F09_u32 as i32, "^", ">>", 16),
                 ];
                 for (op1, v1, op2, op3, v3) in stages {
-                    let c1 = self.hash_const_reg(v1);
-                    let c3 = self.hash_const_reg(v3);
+                    let c1 = self.hash_const_vector_reg(v1);
+                    let c3 = self.hash_const_vector_reg(v3);
                     let t1 = self.emit_binary(op_text_to_bin(op1), a, c1, ValueType::Vector);
                     let t2 = self.emit_binary(op_text_to_bin(op3), a, c3, ValueType::Vector);
                     a = self.emit_binary(op_text_to_bin(op2), t1, t2, ValueType::Vector);
@@ -690,8 +745,146 @@ impl FuncLowering {
                 self.emit(InstrKind::Flow(FlowInst::Sync), UnitClass::LoadStore);
                 Ok(self.zero_reg())
             }
+            "spawn" => self.lower_spawn(c),
+            "__builtin_block_idx" => {
+                if !c.node.arguments.is_empty() {
+                    return Err(AstLoweringError::Unsupported(
+                        "__builtin_block_idx takes no arguments",
+                    ));
+                }
+                let ctx = self.spawn_context.ok_or(AstLoweringError::Unsupported(
+                    "__builtin_block_idx is only valid inside a spawn target function",
+                ))?;
+                Ok(ctx.block_idx_reg)
+            }
+            "__builtin_thread_idx" => {
+                if !c.node.arguments.is_empty() {
+                    return Err(AstLoweringError::Unsupported(
+                        "__builtin_thread_idx takes no arguments",
+                    ));
+                }
+                let ctx = self.spawn_context.ok_or(AstLoweringError::Unsupported(
+                    "__builtin_thread_idx is only valid inside a spawn target function",
+                ))?;
+                Ok(self.emit_const(ctx.thread_idx))
+            }
+            "__builtin_block_dim" => {
+                if !c.node.arguments.is_empty() {
+                    return Err(AstLoweringError::Unsupported(
+                        "__builtin_block_dim takes no arguments",
+                    ));
+                }
+                let ctx = self.spawn_context.ok_or(AstLoweringError::Unsupported(
+                    "__builtin_block_dim is only valid inside a spawn target function",
+                ))?;
+                Ok(self.emit_const(ctx.block_dim))
+            }
             _ => Err(AstLoweringError::Unsupported("call target")),
         }
+    }
+
+    /// `spawn(num_blocks, num_threads, target_fn, arg1, …, argN)` — fixed arity; `num_blocks` and
+    /// `num_threads` must be compile-time constants. Inlines the target `B × T` times with disjoint
+    /// thread-local registers; `num_blocks` is fully unrolled so each block uses a fresh `const` for
+    /// `__builtin_block_idx` (sequential reuse of scratch is handled by the allocator).
+    fn lower_spawn(&mut self, c: &Node<lang_c::ast::CallExpression>) -> Result<RegisterId, AstLoweringError> {
+        let args = &c.node.arguments;
+        if args.len() < 3 {
+            return Err(AstLoweringError::Unsupported(
+                "spawn: expected spawn(blocks, threads, fn, ...args)",
+            ));
+        }
+        let num_blocks = try_compile_time_i32(&args[0].node).ok_or(AstLoweringError::Unsupported(
+            "spawn: block count must be a compile-time constant",
+        ))?;
+        let num_threads = try_compile_time_i32(&args[1].node).ok_or(AstLoweringError::Unsupported(
+            "spawn: thread count must be a compile-time constant",
+        ))?;
+        if num_blocks < 0 || num_threads < 1 || num_threads > 64 {
+            return Err(AstLoweringError::Unsupported(
+                "spawn: invalid block or thread count",
+            ));
+        }
+        let b_max = num_blocks as usize;
+        let t_max = num_threads as usize;
+
+        let target_name = match &args[2].node {
+            Expression::Identifier(id) => id.node.name.clone(),
+            _ => {
+                return Err(AstLoweringError::Unsupported(
+                    "spawn: third argument must be the target function name",
+                ));
+            }
+        };
+
+        let fn_def = self
+            .all_functions
+            .get(&target_name)
+            .cloned()
+            .ok_or_else(|| AstLoweringError::UnknownVariable(target_name.clone()))?;
+
+        let params = function_parameters(&fn_def.node)?;
+        if args.len() != 3 + params.len() {
+            return Err(AstLoweringError::Unsupported(
+                "spawn: argument count must match target function parameters",
+            ));
+        }
+
+        let mut arg_regs: Vec<RegisterId> = Vec::with_capacity(params.len());
+        for a in args.iter().skip(3) {
+            arg_regs.push(self.lower_expr(&a.node)?);
+        }
+
+        let parent_vars = self.vars.clone();
+
+        for block_idx in 0..b_max {
+            let block_reg = self.emit_const(block_idx as i32);
+            for thread_idx in 0..t_max {
+                let ctx = SpawnContext {
+                    block_idx_reg: block_reg,
+                    thread_idx: thread_idx as i32,
+                    block_dim: num_threads,
+                };
+                self.lower_spawned_function_body(
+                    &fn_def.node,
+                    &params,
+                    &arg_regs,
+                    &parent_vars,
+                    ctx,
+                )?;
+            }
+        }
+
+        Ok(self.zero_reg())
+    }
+
+    fn lower_spawned_function_body(
+        &mut self,
+        def: &FunctionDefinition,
+        params: &[(String, ValueType)],
+        arg_regs: &[RegisterId],
+        parent_vars: &HashMap<String, RegisterId>,
+        ctx: SpawnContext,
+    ) -> Result<(), AstLoweringError> {
+        let mut child_vars: HashMap<String, RegisterId> = HashMap::new();
+        for name in self.globals.keys() {
+            if let Some(r) = parent_vars.get(name) {
+                child_vars.insert(name.clone(), *r);
+            }
+        }
+        for (i, (name, _ty)) in params.iter().enumerate() {
+            child_vars.insert(name.clone(), arg_regs[i]);
+        }
+
+        let saved_vars = std::mem::replace(&mut self.vars, child_vars);
+        let saved_spawn = self.spawn_context.replace(ctx);
+
+        let body = loop_unroll::unroll_statement(&def.statement.node, &self.globals);
+        self.lower_statement(&body)?;
+
+        self.spawn_context = saved_spawn;
+        self.vars = saved_vars;
+        Ok(())
     }
 
     /// `dst_vec[lane] = load(addr_vec[lane])` with the same compile-time `lane` → one `load_offset`
@@ -933,8 +1126,10 @@ fn declarator_type(decl: &Node<Declarator>) -> ValueType {
     ValueType::Scalar
 }
 
-fn declaration_type(decl: &Declaration) -> ValueType {
-    for spec in &decl.specifiers {
+fn declaration_specifiers_type(
+    specs: &[Node<DeclarationSpecifier>],
+) -> ValueType {
+    for spec in specs {
         if let DeclarationSpecifier::TypeSpecifier(ts) = &spec.node {
             if let TypeSpecifier::TypedefName(id) = &ts.node {
                 if id.node.name == "vec8_t" {
@@ -944,6 +1139,41 @@ fn declaration_type(decl: &Declaration) -> ValueType {
         }
     }
     ValueType::Scalar
+}
+
+fn declaration_type(decl: &Declaration) -> ValueType {
+    declaration_specifiers_type(&decl.specifiers)
+}
+
+fn parameter_type(p: &ParameterDeclaration) -> ValueType {
+    declaration_specifiers_type(&p.specifiers)
+}
+
+fn function_parameters(
+    def: &FunctionDefinition,
+) -> Result<Vec<(String, ValueType)>, AstLoweringError> {
+    let decl = &def.declarator.node;
+    for d in &decl.derived {
+        if let DerivedDeclarator::Function(f) = &d.node {
+            let mut params = Vec::new();
+            for p in &f.node.parameters {
+                let name = match &p.node.declarator {
+                    Some(pd) => declarator_name(pd)?,
+                    None => {
+                        return Err(AstLoweringError::Unsupported(
+                            "spawn target: parameters must be named",
+                        ));
+                    }
+                };
+                let ty = parameter_type(&p.node);
+                params.push((name, ty));
+            }
+            return Ok(params);
+        }
+    }
+    Err(AstLoweringError::Unsupported(
+        "spawn target: expected function declarator with parameters",
+    ))
 }
 
 fn parse_i32_constant(c: &Constant) -> Result<i32, AstLoweringError> {
