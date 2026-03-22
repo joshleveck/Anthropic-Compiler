@@ -8,10 +8,13 @@ mod pass;
 mod vlir;
 
 fn print_usage() {
-    eprintln!("usage: compiler <input.c> [output.json]");
+    eprintln!("usage: compiler <input.c> [output.json] [options]");
     eprintln!("  Compiles the first `kernel()` in the translation unit to VLIW JSON.");
     eprintln!("  If output.json is omitted, writes to output/compiled_<unix_time>.json");
     eprintln!("  JSON: {{ instructions: [ bundles ], debug_info: {{ scratch_map: {{ addr: [name, len] }} }} }}.");
+    eprintln!("options:");
+    eprintln!("  --no-schedule   Disable advanced VLIW instruction scheduling (one IR op per bundle).");
+    eprintln!("                  Default: scheduling enabled.");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,6 +25,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
         return Ok(());
+    }
+
+    let mut advanced_scheduling = true;
+    args.retain(|a| {
+        if a == "--no-schedule" {
+            advanced_scheduling = false;
+            false
+        } else {
+            true
+        }
+    });
+
+    if args.is_empty() {
+        eprintln!("error: missing input.c");
+        print_usage();
+        std::process::exit(2);
     }
 
     let input_path = args.remove(0);
@@ -40,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("AST lowering error: {e:?}"))?;
 
     let machine_programs = program
-        .lower_to_machine()
+        .lower_to_machine(advanced_scheduling)
         .map_err(|e| format!("Machine lowering error: {e:?}"))?;
 
     if machine_programs.len() != 1 {

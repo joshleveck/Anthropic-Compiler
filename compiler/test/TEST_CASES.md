@@ -16,6 +16,8 @@ Or compile one file:
 cd compiler && cargo run --quiet -- test/t10_vector_mod2.c output/t.json
 ```
 
+Advanced VLIW scheduling is on by default; pass `--no-schedule` to emit one IR op per bundle (legacy behavior).
+
 Compiler JSON output shape (for `load_from_rust.load_kernel_from_rust`):
 
 ```json

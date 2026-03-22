@@ -182,8 +182,11 @@ impl Function {
         }
     }
 
-    pub fn lower_to_machine(&self) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
-        machine::lower_function(self)
+    pub fn lower_to_machine(
+        &self,
+        advanced_scheduling: bool,
+    ) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
+        machine::lower_function(self, advanced_scheduling)
     }
 }
 
@@ -193,15 +196,18 @@ pub struct Program {
 }
 
 impl Program {
-    pub fn lower_to_machine(&self) -> Result<Vec<(MachineProgram, ScratchDebugMap)>, LoweringError> {
+    pub fn lower_to_machine(
+        &self,
+        advanced_scheduling: bool,
+    ) -> Result<Vec<(MachineProgram, ScratchDebugMap)>, LoweringError> {
         self.functions
             .iter()
-            .map(Function::lower_to_machine)
+            .map(|f| f.lower_to_machine(advanced_scheduling))
             .collect()
     }
 
     pub fn to_python_list_literal(&self) -> Result<Vec<String>, LoweringError> {
-        let lowered = self.lower_to_machine()?;
+        let lowered = self.lower_to_machine(true)?;
         Ok(lowered
             .iter()
             .map(|(p, _)| InstructionBundle::program_to_python_list_literal(p))

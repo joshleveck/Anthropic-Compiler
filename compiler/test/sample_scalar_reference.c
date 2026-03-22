@@ -56,7 +56,7 @@ void kernel()
             debug(node_val, h, i, 2);
             val = myhash(val ^ node_val);
             debug(val, h, i, 3);
-            idx = TWO * idx + val % TWO + ONE;
+            idx = ((TWO * idx) + ONE) + (val % TWO);
             debug(idx, h, i, 4);
 
             if (is_wrap_around_round)

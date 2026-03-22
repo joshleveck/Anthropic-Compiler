@@ -495,10 +495,32 @@ fn build_scheduled_block(insts: &[&crate::vlir::Instruction]) -> ScheduledBlock 
     cycles
 }
 
-fn schedule_emitted_blocks(
+/// One emitted instruction per bundle (original lowering behavior).
+fn sequential_emitted_blocks(
     func: &Function,
     emitted: &HashSet<crate::vlir::InstrId>,
 ) -> Vec<ScheduledBlock> {
+    func.blocks
+        .iter()
+        .map(|block| {
+            block
+                .instructions
+                .iter()
+                .filter(|inst| emitted.contains(&inst.id))
+                .map(|inst| vec![inst.id])
+                .collect()
+        })
+        .collect()
+}
+
+fn schedule_emitted_blocks(
+    func: &Function,
+    emitted: &HashSet<crate::vlir::InstrId>,
+    advanced_scheduling: bool,
+) -> Vec<ScheduledBlock> {
+    if !advanced_scheduling {
+        return sequential_emitted_blocks(func, emitted);
+    }
     let mut out = Vec::with_capacity(func.blocks.len());
     for block in &func.blocks {
         let emitted_insts: Vec<&crate::vlir::Instruction> = block
@@ -530,9 +552,12 @@ fn build_scratch_debug_map(func: &Function, layout: &ScratchLayout) -> Result<Sc
     Ok(out)
 }
 
-pub fn lower_function(func: &Function) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
+pub fn lower_function(
+    func: &Function,
+    advanced_scheduling: bool,
+) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
     let emitted = build_emission_plan(func);
-    let scheduled_blocks = schedule_emitted_blocks(func, &emitted);
+    let scheduled_blocks = schedule_emitted_blocks(func, &emitted, advanced_scheduling);
     let use_counts = collect_use_counts(func, &scheduled_blocks);
     let scratch = build_greedy_scratch_layout(func, &use_counts, &scheduled_blocks)?;
     let scratch_debug = build_scratch_debug_map(func, &scratch)?;
