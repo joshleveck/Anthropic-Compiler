@@ -1,5 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::fs;
+
+use petgraph::dot::{Config, Dot};
+use petgraph::graph::UnGraph;
+use petgraph::{Directed, Graph};
+use visgraph::settings::SettingsBuilder;
+use visgraph::{Layout, graph_to_svg};
 
 use crate::vlir::alu::{AluInst, AluOp};
 use crate::vlir::flow::{FlowInst, Terminator};
@@ -9,13 +16,16 @@ use crate::vlir::valu::{ValuInst, ValuOp};
 use crate::vlir::{BlockId, Function, InstrKind, Operand, RegisterId, ValueType};
 
 /// Must match `problem.SCRATCH_SIZE` — scratch is indexed by word (32-bit), 0..this-1.
-pub const MACHINE_SCRATCH_SIZE: usize = 1536;
+pub const MACHINE_SCRATCH_SIZE: usize = 100000; //1536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoweringError {
     SlotLimitExceeded(String, usize, usize),
     /// Emitted scratch words would exceed the simulator scratch space.
-    ScratchOverflow { used: usize, limit: usize },
+    ScratchOverflow {
+        used: usize,
+        limit: usize,
+    },
     MissingRegisterType(RegisterId),
     MissingScratch(RegisterId),
     UnsupportedImmediate(&'static str),
@@ -215,7 +225,10 @@ impl InstructionBundle {
     }
 
     /// Full compiler output: instruction bundles plus `debug_info.scratch_map` for `problem.DebugInfo`.
-    pub fn program_to_json_with_debug(program: &MachineProgram, scratch_map: &ScratchDebugMap) -> String {
+    pub fn program_to_json_with_debug(
+        program: &MachineProgram,
+        scratch_map: &ScratchDebugMap,
+    ) -> String {
         let instr = Self::program_to_json(program);
         let mut keys: Vec<usize> = scratch_map.keys().copied().collect();
         keys.sort_unstable();
@@ -317,9 +330,9 @@ fn instr_engine_kind(inst: &crate::vlir::Instruction) -> EngineKind {
         InstrKind::Store(_) => EngineKind::Store,
         InstrKind::Flow(_) => EngineKind::Flow,
         InstrKind::DebugCompare { .. } => EngineKind::Debug,
-        InstrKind::Alu(_) | InstrKind::VectorLaneStore { .. } | InstrKind::VectorLaneLoad { .. } => {
-            EngineKind::Alu
-        }
+        InstrKind::Alu(_)
+        | InstrKind::VectorLaneStore { .. }
+        | InstrKind::VectorLaneLoad { .. } => EngineKind::Alu,
         InstrKind::Valu(_) => EngineKind::Valu,
     }
 }
@@ -356,6 +369,37 @@ fn shares_reg(a: &[RegisterId], b: &[RegisterId]) -> bool {
     a.iter().any(|x| b.contains(x))
 }
 
+/// True when `a` and `b` write different 32-bit words of the same vector register
+/// (`node_val[vi] = …` / `load_offset` gathers). The IR still uses one `RegisterId` for the
+/// whole vector, so plain `defs` overlap is a false WAW; the simulator only touches one lane.
+fn partial_vector_writes_disjoint(
+    a: &crate::vlir::Instruction,
+    b: &crate::vlir::Instruction,
+) -> bool {
+    match (&a.kind, &b.kind) {
+        (InstrKind::Load(la), InstrKind::Load(lb))
+            if la.vector_gather && lb.vector_gather && la.dst == lb.dst =>
+        {
+            la.offset != lb.offset
+        }
+        (InstrKind::Load(l), InstrKind::VectorLaneStore { vec, lane, .. })
+        | (InstrKind::VectorLaneStore { vec, lane, .. }, InstrKind::Load(l))
+            if l.vector_gather && l.dst == *vec =>
+        {
+            l.offset != i32::from(*lane)
+        }
+        (
+            InstrKind::VectorLaneStore {
+                vec: va, lane: la, ..
+            },
+            InstrKind::VectorLaneStore {
+                vec: vb, lane: lb, ..
+            },
+        ) => va == vb && la != lb,
+        _ => false,
+    }
+}
+
 fn has_dependency(
     a: &crate::vlir::Instruction,
     b: &crate::vlir::Instruction,
@@ -370,20 +414,34 @@ fn has_dependency(
     }
 
     // Register hazards under end-of-cycle writeback:
-    // RAW, WAW, WAR are all ordering constraints.
-    if shares_reg(defs_a, uses_b) || shares_reg(defs_a, defs_b) || shares_reg(uses_a, defs_b) {
+    // - RAW: producer must precede consumer.
+    // - WAW: preserve deterministic final value (except lane-disjoint partial writes below).
+    // NOTE: WAR is intentionally allowed; both reads see pre-cycle state and writes commit at
+    // end of cycle, so anti-dependencies do not require ordering within a bundle.
+    if shares_reg(defs_a, uses_b) {
+        return true;
+    }
+    if shares_reg(defs_a, defs_b) && !partial_vector_writes_disjoint(a, b) {
         return true;
     }
 
     // Conservative memory model: preserve order around any store.
-    let mem_a = has_memory_load(a) || has_memory_store(a);
-    let mem_b = has_memory_load(b) || has_memory_store(b);
-    if mem_a && mem_b && (has_memory_store(a) || has_memory_store(b)) {
-        return true;
-    }
+    // let mem_a = has_memory_load(a) || has_memory_store(a);
+    // let mem_b = has_memory_load(b) || has_memory_store(b);
+    // if mem_a && mem_b && (has_memory_store(a) || has_memory_store(b)) {
+    //     return true;
+    // }
 
-    // Keep externally observable side effects in original order.
+    // Keep externally observable side effects in original order — except lane-disjoint
+    // `vector_gather` / `VectorLaneStore` pairs, which only touch different scratch words.
     if has_observable_ordering(a) && has_observable_ordering(b) {
+        if partial_vector_writes_disjoint(a, b) {
+            return false;
+        }
+        // ignore stores
+        if has_memory_store(a) || has_memory_store(b) {
+            return false;
+        }
         return true;
     }
 
@@ -413,6 +471,8 @@ fn build_scheduled_block(insts: &[&crate::vlir::Instruction]) -> ScheduledBlock 
             }
         }
     }
+
+    create_graph(insts, &succs);
 
     // Critical-path priority: max successor depth + latency.
     let mut crit = vec![0usize; n];
@@ -543,7 +603,10 @@ fn terminator_bundle_count(term: &Terminator) -> usize {
     }
 }
 
-fn build_scratch_debug_map(func: &Function, layout: &ScratchLayout) -> Result<ScratchDebugMap, LoweringError> {
+fn build_scratch_debug_map(
+    func: &Function,
+    layout: &ScratchLayout,
+) -> Result<ScratchDebugMap, LoweringError> {
     let mut out = ScratchDebugMap::new();
     for (&reg, &base) in &layout.map {
         let w = reg_width(func, reg)?;
@@ -794,7 +857,7 @@ fn collect_use_counts(
             }
         }
         for r in uses_in_terminator(&block.terminator) {
-                *uses.entry(r).or_insert(0) += 1;
+            *uses.entry(r).or_insert(0) += 1;
         }
     }
     uses
@@ -1081,4 +1144,28 @@ fn valu_name(op: ValuOp) -> &'static str {
         ValuOp::CmpLt => "<",
         ValuOp::Broadcast => "vbroadcast",
     }
+}
+
+fn create_graph(insts: &[&crate::vlir::Instruction], succs: &Vec<Vec<usize>>) {
+    let mut graph = Graph::<String, (), Directed>::new();
+
+    let mut nodes = vec![];
+
+    for (i, inst) in insts.iter().enumerate() {
+        nodes.push(graph.add_node(format!("inst {:?} ", inst.kind)));
+    }
+
+    for (i, inst) in insts.iter().enumerate() {
+        for succ in &succs[i] {
+            graph.add_edge(nodes[i], nodes[*succ], ());
+        }
+    }
+
+    // write to dot file "graph.dot"
+
+    fs::write(
+        "graph.dot",
+        format!("{:?}", Dot::with_config(&graph, &[Config::EdgeNoLabel])),
+    )
+    .unwrap();
 }

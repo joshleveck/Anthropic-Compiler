@@ -503,6 +503,32 @@ def case_t25() -> None:
     assert_mem_slice(final, data_ptr, exp, "t25 dst[lane]=load(addr[lane])")
 
 
+def case_t26() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    final = run_program(mem, OUT_JSON)
+    exp: list[int] = []
+    for chunk in range(4):
+        exp.extend([u32(chunk)] * VLEN)
+    assert_mem_slice(final, data_ptr, exp, "t26 spawn 2x2 worker vbroadcast(i)")
+
+
+def case_t26_compare() -> None:
+    data_ptr = 200
+    mem = [0] * 2048
+    mem[P_INP_VALUES_P] = data_ptr
+    final = load_kernel_from_rust(OUT_JSON)
+    OUT_JSON_COMPARE = COMPILER_DIR / "output" / "harness_program_compare.json"
+    compile_c_to_json(TEST_DIR / "t26_spawn.c", OUT_JSON_COMPARE)
+    final_compare = load_kernel_from_rust(OUT_JSON_COMPARE)
+    if len(final.instrs) != len(final_compare.instrs):
+        print(
+            f"t26_spawn_compare expected same program length, got {len(final.instrs)} and {len(final_compare.instrs)}"
+        )
+        assert False
+
+
 CASES: dict[str, Callable[[], None]] = {
     "t01_scalar_load_store": case_t01,
     "t02_vector_load_store": case_t02,
@@ -528,6 +554,8 @@ CASES: dict[str, Callable[[], None]] = {
     "t23_vector_multiply_add": case_t23,
     "t24_vector_multiply_add_add": case_t24,
     "t25_load_offset_gather": case_t25,
+    "t26_spawn": case_t26,
+    "t26_spawn_compare": case_t26_compare,
 }
 
 

@@ -49,7 +49,7 @@ void kernel()
 
     __builtin_flow_pause(); // needed for reference kernel
 
-    for (uint32_t i = 0; i < BATCH_SIZE; i += VLEN)
+    for (uint32_t i = 0; i < BATCH_SIZE; i += VLEN * 2)
     {
         uint32_t idx_addr = inp_indices_p + i;
         uint32_t val_addr = inp_values_p + i;
@@ -92,6 +92,53 @@ void kernel()
             // __builtin_debug(idx, h, i, 5);
         }
 
+                // __builtin_sync();
+
+        // NUMBER 2
+
+        uint32_t idx_addr_0 = inp_indices_p + i + VLEN;
+        uint32_t val_addr_0 = inp_values_p + i + VLEN;
+
+        vec8_t idx_0 = __builtin_vload(idx_addr_0);
+        vec8_t val_0 = __builtin_vload(val_addr_0);
+
+        for (uint32_t h_0 = 0; h_0 < ROUNDS; h_0++)
+        {
+            uint32_t round_in_tree = h_0 % (FOREST_HEIGHT + 1);
+            uint32_t is_wrap_around_round = round_in_tree == FOREST_HEIGHT;
+            uint32_t is_zero_round = round_in_tree == 0;
+
+            if (is_zero_round)
+            {
+                node_val_0 = __builtin_vbroadcast(FOREST_ZERO_VALUE);
+            }
+            else
+            {
+                vec8_t forest_indicies_0 = VFOREST_VALUES_P + idx_0;
+                vec8_t node_val_0;
+                for (int vi = 0; vi < VLEN; vi++)
+                {
+                    node_val_0[vi] = __builtin_load(forest_indicies_0[vi]);
+                }
+            }
+
+            // __builtin_debug(node_val, h, i, 2);
+            val_0 = __builtin_vhash(val_0 ^ node_val_0);
+            // __builtin_debug(val, h, i, 3);
+            vec8_t val_mod_two_0 = val_0 % VTWO;
+            vec8_t two_idx_plus_one_0 = VTWO * idx_0 + VONE;
+            idx_0 = two_idx_plus_one_0 + val_mod_two_0;
+            // __builtin_debug(idx, h, i, 4);
+
+            if (is_wrap_around_round)
+            {
+                idx_0 = VZERO;
+            }
+            // __builtin_debug(idx, h, i, 5);
+        }
+
+        __builtin_vstore(val_addr_0, val_0);
+        __builtin_vstore(idx_addr_0, idx_0);
         __builtin_vstore(val_addr, val);
         __builtin_vstore(idx_addr, idx);
         __builtin_sync();

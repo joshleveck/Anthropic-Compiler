@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 lang-c = "0.15.1"
+petgraph = "0.8.3"
+visgraph = "0.1.0"
