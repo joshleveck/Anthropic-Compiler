@@ -3,7 +3,6 @@ use crate::vlir::RegisterId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadKind {
     I32,
-    U32,
     Vec128,
 }
 

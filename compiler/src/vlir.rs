@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use alu::AluInst;
 use flow::{FlowInst, Terminator};
 use load::LoadInst;
-use machine::{InstructionBundle, LoweringError, MachineProgram, ScratchDebugMap};
+use machine::{
+    InstructionBundle, LoweringError, MachineProgram, ScratchDebugMap, ScratchLifetimeTrace,
+};
 use store::StoreInst;
 use valu::ValuInst;
 
@@ -28,18 +30,19 @@ pub struct InstrId(pub u32);
 pub enum ValueType {
     Scalar,
     Vector,
-    Ptr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
     Reg(RegisterId),
-    ImmI32(i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstrKind {
-    Const { dst: RegisterId, value: i32 },
+    Const {
+        dst: RegisterId,
+        value: i32,
+    },
     /// Write scalar `src` into lane `lane` (0..7) of vector `vec` (scratch `base(vec)+lane`).
     /// `zero` must hold 0; used as `dst = src + zero` to copy into the lane word.
     VectorLaneStore {
@@ -186,31 +189,21 @@ impl Function {
         &self,
         advanced_scheduling: bool,
     ) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
-        machine::lower_function(self, advanced_scheduling)
+        let (p, d, _) = machine::lower_function(self, advanced_scheduling, false)?;
+        Ok((p, d))
+    }
+
+    /// Machine lowering with scratch allocator lifetime trace (for debugging / visualization).
+    pub fn lower_to_machine_traced(
+        &self,
+        advanced_scheduling: bool,
+    ) -> Result<(MachineProgram, ScratchDebugMap, ScratchLifetimeTrace), LoweringError> {
+        let (p, d, t) = machine::lower_function(self, advanced_scheduling, true)?;
+        Ok((p, d, t.unwrap()))
     }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct Program {
     pub functions: Vec<Function>,
-}
-
-impl Program {
-    pub fn lower_to_machine(
-        &self,
-        advanced_scheduling: bool,
-    ) -> Result<Vec<(MachineProgram, ScratchDebugMap)>, LoweringError> {
-        self.functions
-            .iter()
-            .map(|f| f.lower_to_machine(advanced_scheduling))
-            .collect()
-    }
-
-    pub fn to_python_list_literal(&self) -> Result<Vec<String>, LoweringError> {
-        let lowered = self.lower_to_machine(true)?;
-        Ok(lowered
-            .iter()
-            .map(|(p, _)| InstructionBundle::program_to_python_list_literal(p))
-            .collect())
-    }
 }

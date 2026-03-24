@@ -1,6 +1,4 @@
 use lang_c::driver::{Config, parse};
-use lang_c::print::Printer;
-use lang_c::visit::Visit;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -24,33 +22,34 @@ fn print_usage() {
         "  --no-schedule   Disable advanced VLIW instruction scheduling (one IR op per bundle)."
     );
     eprintln!("                  Default: scheduling enabled.");
+    eprintln!(
+        "  --trace-scratch Record scratch allocator alloc/use/free in debug_info.scratch_lifetime."
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
-    // if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-    //     print_usage();
-    //     if args.is_empty() {
-    //         std::process::exit(2);
-    //     }
-    //     return Ok(());
-    // }
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        print_usage();
+        if args.is_empty() {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
 
     let mut advanced_scheduling = true;
-    // args.retain(|a| {
-    //     if a == "--no-schedule" {
-    //         advanced_scheduling = false;
-    //         false
-    //     } else {
-    //         true
-    //     }
-    // });
-
-    // if args.is_empty() {
-    //     eprintln!("error: missing input.c");
-    //     print_usage();
-    //     std::process::exit(2);
-    // }
+    let mut trace_scratch = false;
+    args.retain(|a| {
+        if a == "--no-schedule" {
+            advanced_scheduling = false;
+            return false;
+        }
+        if a == "--trace-scratch" {
+            trace_scratch = true;
+            return false;
+        }
+        true
+    });
 
     let input_path = if !args.is_empty() {
         args.remove(0)
@@ -76,9 +75,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program = vlir::lowering::lower_translation_unit(&ast.unit)
         .map_err(|e| format!("AST lowering error: {e:?}"))?;
 
-    let machine_programs = program
-        .lower_to_machine(advanced_scheduling)
-        .map_err(|e| format!("Machine lowering error: {e:?}"))?;
+    let machine_programs: Result<Vec<_>, _> = program
+        .functions
+        .iter()
+        .map(|f| {
+            if trace_scratch {
+                f.lower_to_machine_traced(advanced_scheduling)
+                    .map(|(p, d, t)| (p, d, Some(t)))
+            } else {
+                f.lower_to_machine(advanced_scheduling)
+                    .map(|(p, d)| (p, d, None))
+            }
+        })
+        .collect();
+    let machine_programs =
+        machine_programs.map_err(|e| format!("Machine lowering error: {e:?}"))?;
 
     if machine_programs.len() != 1 {
         eprintln!(
@@ -87,11 +98,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let Some((prog, scratch_debug)) = machine_programs.first() else {
+    let Some((prog, scratch_debug, scratch_trace)) = machine_programs.first() else {
         return Err("no machine program produced (missing kernel()?)".into());
     };
 
-    let json = vlir::machine::InstructionBundle::program_to_json_with_debug(prog, scratch_debug);
+    let json = vlir::machine::InstructionBundle::program_to_json_with_debug_and_trace(
+        prog,
+        scratch_debug,
+        scratch_trace.as_ref(),
+    );
     if let Some(parent) = Path::new(&out_path).parent() {
         fs::create_dir_all(parent)?;
     }

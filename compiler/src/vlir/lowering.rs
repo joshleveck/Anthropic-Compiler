@@ -2,9 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use lang_c::ast::{
     BinaryOperator, BlockItem, Constant, Declaration, DeclarationSpecifier, Declarator,
-    DeclaratorKind, Expression, ExternalDeclaration, ForInitializer,
-    FunctionDefinition, InitDeclarator, Statement, TranslationUnit,
-    TypeSpecifier, UnaryOperator,
+    DeclaratorKind, Expression, ExternalDeclaration, ForInitializer, FunctionDefinition,
+    InitDeclarator, Statement, TranslationUnit, TypeSpecifier, UnaryOperator,
 };
 use lang_c::span::Node;
 
@@ -185,8 +184,7 @@ impl FuncLowering {
         ty: ValueType,
     ) -> RegisterId {
         if ty == ValueType::Scalar {
-            if let (Some(&lv), Some(&rv)) =
-                (self.const_value.get(&lhs), self.const_value.get(&rhs))
+            if let (Some(&lv), Some(&rv)) = (self.const_value.get(&lhs), self.const_value.get(&rhs))
                 && let Some(folded) = try_fold_scalar_binop(&op, lv, rv)
             {
                 return self.emit_scalar_const_value(folded);
@@ -456,7 +454,9 @@ impl FuncLowering {
         use BinaryOperator::*;
         match b.operator.node {
             Assign => {
-                if let Some(out) = self.try_emit_load_offset_gather_assign(&b.lhs.node, &b.rhs.node)? {
+                if let Some(out) =
+                    self.try_emit_load_offset_gather_assign(&b.lhs.node, &b.rhs.node)?
+                {
                     return Ok(out);
                 }
                 let rhs = self.lower_expr(&b.rhs.node)?;
@@ -689,16 +689,22 @@ impl FuncLowering {
                 }
                 let v = self.lower_expr(&c.node.arguments[0].node)?;
                 let round = try_compile_time_i32(&c.node.arguments[1].node).ok_or(
-                    AstLoweringError::Unsupported("__builtin_debug: round must be compile-time constant"),
+                    AstLoweringError::Unsupported(
+                        "__builtin_debug: round must be compile-time constant",
+                    ),
                 )?;
                 let batch = try_compile_time_i32(&c.node.arguments[2].node).ok_or(
-                    AstLoweringError::Unsupported("__builtin_debug: batch must be compile-time constant"),
+                    AstLoweringError::Unsupported(
+                        "__builtin_debug: batch must be compile-time constant",
+                    ),
                 )?;
                 let tag = try_compile_time_i32(&c.node.arguments[3].node).ok_or(
-                    AstLoweringError::Unsupported("__builtin_debug: tag must be compile-time constant"),
+                    AstLoweringError::Unsupported(
+                        "__builtin_debug: tag must be compile-time constant",
+                    ),
                 )?;
                 if !(0..=5).contains(&tag) {
-                    return Err(                    AstLoweringError::Unsupported(
+                    return Err(AstLoweringError::Unsupported(
                         "__builtin_debug: tag must be 0..=5 (idx,val,node_val,hashed_val,next_idx,wrapped_idx)",
                     ));
                 }
@@ -974,9 +980,7 @@ fn declarator_type(decl: &Node<Declarator>) -> ValueType {
     ValueType::Scalar
 }
 
-fn declaration_specifiers_type(
-    specs: &[Node<DeclarationSpecifier>],
-) -> ValueType {
+fn declaration_specifiers_type(specs: &[Node<DeclarationSpecifier>]) -> ValueType {
     for spec in specs {
         if let DeclarationSpecifier::TypeSpecifier(ts) = &spec.node {
             if let TypeSpecifier::TypedefName(id) = &ts.node {
