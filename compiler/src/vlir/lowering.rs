@@ -649,6 +649,7 @@ impl FuncLowering {
                 Ok(dst)
             }
             // Inline __builtin_vhash(a) for sample.c as repeated vector ops.
+            // Fuse `(a + C) + (a << k)` → `multiply_add(a, (1<<k)+1, C)` when the stage matches.
             "__builtin_vhash" => {
                 let mut a = self.lower_expr(&c.node.arguments[0].node)?;
                 let stages: [(&str, i32, &str, &str, i32); 6] = [
@@ -660,6 +661,24 @@ impl FuncLowering {
                     ("^", 0xB55A4F09_u32 as i32, "^", ">>", 16),
                 ];
                 for (op1, v1, op2, op3, v3) in stages {
+                    if op1 == "+" && op2 == "+" && op3 == "<<" {
+                        let mult = 1i32.wrapping_shl((v3 as u32) & 31).wrapping_add(1);
+                        let c_mul = self.hash_const_vector_reg(mult);
+                        let c_add = self.hash_const_vector_reg(v1);
+                        let dst = self.new_temp(ValueType::Vector);
+                        self.emit(
+                            InstrKind::Valu(ValuInst {
+                                op: ValuOp::Mul,
+                                dst,
+                                src1: a,
+                                src2: c_mul,
+                                src3: Some(c_add),
+                            }),
+                            UnitClass::VectorAlu,
+                        );
+                        a = dst;
+                        continue;
+                    }
                     let c1 = self.hash_const_vector_reg(v1);
                     let c3 = self.hash_const_vector_reg(v3);
                     let t1 = self.emit_binary(op_text_to_bin(op1), a, c1, ValueType::Vector);

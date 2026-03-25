@@ -175,7 +175,6 @@ pub(crate) fn schedule_emitted_blocks(
     }
     out
 }
-
 fn create_graph(insts: &[&crate::vlir::Instruction], succs: &[Vec<usize>]) {
     let mut graph = Graph::<String, (), Directed>::new();
 

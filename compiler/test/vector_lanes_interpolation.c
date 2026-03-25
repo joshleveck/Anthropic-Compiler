@@ -2,6 +2,9 @@
  * Vector-lane kernel using __builtin_spawn(blocks, threads, execute_rounds, ...).
  * Each block must advance the batch pointer by VLEN words (same as `for (i += VLEN)` in sample_vector_reference.c).
  * Example: __builtin_spawn(32, 1, ...) matches BATCH_SIZE 256 with one vec8 chunk per block.
+ *
+ * Shallow levels 0–2: broadcast / vselect (no gather). Deeper levels: vector gather.
+ * Index parity uses `& 1` and `idx + idx + 1` instead of `%` / `*`.
  */
 typedef unsigned long uint32_t;
 typedef uint32_t vec8_t[8];
@@ -18,9 +21,6 @@ void __builtin_flow_pause(void);
 uint32_t __builtin_block_idx(void);
 uint32_t __builtin_thread_idx(void);
 uint32_t __builtin_block_dim(void);
-// void __builtin_spawn(unsigned int, unsigned int,
-//                      void (*)(uint32_t, uint32_t, uint32_t, uint32_t, vec8_t, vec8_t, vec8_t, vec8_t),
-//                      uint32_t, uint32_t, uint32_t, uint32_t, vec8_t, vec8_t, vec8_t, vec8_t);
 
 uint32_t *p_inp_values_p = (uint32_t *)6;
 uint32_t *p_inp_indices_p = (uint32_t *)5;
@@ -36,11 +36,10 @@ const uint32_t ZERO = 0;
 const uint32_t ONE = 1;
 const uint32_t TWO = 2;
 const uint32_t THREE = 3;
-const uint32_t FOUR = 4;
 
 void execute_rounds(uint32_t inp_indices_p, uint32_t inp_values_p, uint32_t forest_values_p,
                     uint32_t forest_zero_value, vec8_t vforest_values_p, vec8_t vzero,
-                    vec8_t vone, vec8_t vtwo, vec8_t vthree, vec8_t vfour,
+                    vec8_t vone, vec8_t vtwo, vec8_t vthree,
                     vec8_t vforest_one_value, vec8_t vforest_two_value, vec8_t vforest_three_value,
                     vec8_t vforest_four_value, vec8_t vforest_five_value, vec8_t vforest_six_value)
 {
@@ -67,18 +66,18 @@ void execute_rounds(uint32_t inp_indices_p, uint32_t inp_values_p, uint32_t fore
         }
         else if (is_one_two_round)
         {
-            uint32_t idx_minus_one = idx - vone;
+            vec8_t idx_minus_one = idx - vone;
             node_val = __builtin_vselect(idx_minus_one, vforest_two_value, vforest_one_value);
         }
         else if (is_three_four_round)
         {
-            uint32_t idx_minus_three = idx - vthree;
-            uint32_t idx_minus_three_div_two = idx_minus_three / vtwo;
-            uint32_t idx_minus_three_mod_two = idx_minus_three % vtwo;
+            vec8_t rel = idx - vthree;
+            vec8_t b0 = rel & vone;
+            vec8_t b1 = rel >> vone;
 
-            vec8_t low_pair = __builtin_vselect(idx_minus_three_mod_two, vforest_four_value, vforest_three_value);
-            vec8_t high_pair = __builtin_vselect(idx_minus_three_mod_two, vforest_six_value, vforest_five_value);
-            node_val = __builtin_vselect(idx_minus_three_div_two, high_pair, low_pair);
+            vec8_t low_pair = __builtin_vselect(b0, vforest_four_value, vforest_three_value);
+            vec8_t high_pair = __builtin_vselect(b0, vforest_six_value, vforest_five_value);
+            node_val = __builtin_vselect(b1, high_pair, low_pair);
         }
         else
         {
@@ -90,15 +89,27 @@ void execute_rounds(uint32_t inp_indices_p, uint32_t inp_values_p, uint32_t fore
         }
 
         val = __builtin_vhash(val ^ node_val);
-        vec8_t val_mod_two = val % vtwo;
-        vec8_t two_idx_plus_one = vtwo * idx + vone;
-        idx = two_idx_plus_one + val_mod_two;
-
         if (is_wrap_around_round)
         {
             idx = vzero;
         }
-        __builtin_sync();
+        else
+        {
+            vec8_t val_bit = val & vone;
+            vec8_t two_idx_plus_one = vtwo * idx + vone;
+            idx = two_idx_plus_one + val_bit;
+        }
+
+        // Yes my compile time optimizer is bad
+        // Also, yes these are kinda random, but it works
+        if (h == 10)
+        {
+            __builtin_sync();
+        }
+        else if (h == 12)
+        {
+            __builtin_sync();
+        }
     }
 
     __builtin_vstore(val_addr, val);
@@ -117,7 +128,6 @@ void kernel()
     const vec8_t VONE = __builtin_vbroadcast(ONE);
     const vec8_t VTWO = __builtin_vbroadcast(TWO);
     const vec8_t VTHREE = __builtin_vbroadcast(THREE);
-    const vec8_t VFOUR = __builtin_vbroadcast(FOUR);
     const vec8_t VFOREST_VALUES_P = __builtin_vbroadcast(forest_values_p);
 
     const uint32_t FOREST_ZERO_VALUE = __builtin_load(forest_values_p);
@@ -137,7 +147,7 @@ void kernel()
     __builtin_flow_pause();
 
     __builtin_spawn(1, 32, execute_rounds, inp_indices_p, inp_values_p, forest_values_p, FOREST_ZERO_VALUE,
-                    VFOREST_VALUES_P, VZERO, VONE, VTWO, VTHREE, VFOUR, VFOREST_ONE_VALUE,
+                    VFOREST_VALUES_P, VZERO, VONE, VTWO, VTHREE, VFOREST_ONE_VALUE,
                     VFOREST_TWO_VALUE, VFOREST_THREE_VALUE, VFOREST_FOUR_VALUE, VFOREST_FIVE_VALUE,
                     VFOREST_SIX_VALUE);
 

@@ -75,9 +75,9 @@ void execute_rounds(uint32_t inp_indices_p, uint32_t inp_values_p, uint32_t fore
         }
 
         val = __builtin_vhash(val ^ node_val);
-        vec8_t val_mod_two = val % vtwo;
-        vec8_t two_idx_plus_one = vtwo * idx + vone;
-        idx = two_idx_plus_one + val_mod_two;
+        uint32_t val_bit = val & vone;
+        uint32_t two_idx_plus_one = idx + idx + vone;
+        idx = two_idx_plus_one + val_bit;
 
         if (is_wrap_around_round)
         {
