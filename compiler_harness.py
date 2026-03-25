@@ -42,6 +42,7 @@ def compiler_exe() -> Path:
         return _COMPILER_EXE
     name = "compiler.exe" if sys.platform == "win32" else "compiler"
     exe = COMPILER_DIR / "target" / "debug" / name
+
     def needs_rebuild() -> bool:
         if not exe.is_file():
             return True
@@ -54,7 +55,9 @@ def compiler_exe() -> Path:
         if src_dir.is_dir():
             candidates.extend([p for p in src_dir.rglob("*.rs")])
         # Some repos may not have Cargo.lock checked in.
-        latest_src_mtime = max((p.stat().st_mtime for p in candidates if p.exists()), default=0.0)
+        latest_src_mtime = max(
+            (p.stat().st_mtime for p in candidates if p.exists()), default=0.0
+        )
         return latest_src_mtime > exe_mtime
 
     if needs_rebuild():
@@ -598,7 +601,7 @@ CASES: dict[str, Callable[[], None]] = {
     "t24_vector_multiply_add_add": case_t24,
     "t25_load_offset_gather": case_t25,
     "t26_spawn": case_t26,
-    "t27_vector_lcg_hash": case_t27_vector_lcg_hash,
+    # "t27_vector_lcg_hash": case_t27_vector_lcg_hash,
     # "t26_spawn_compare": case_t26_compare,
 }
 

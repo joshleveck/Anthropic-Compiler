@@ -365,17 +365,16 @@ fn expand_spawn_call(
 
     let unrolled_body = crate::pass::loop_unroll::unroll_statement(&fn_def.node.statement.node, globals);
     let body_items = function_body_to_block_items(&unrolled_body)?;
-    let vector_param_count = params.iter().filter(|(_, is_vec)| *is_vec).count();
-    // Interleaving threads across sync-separated segments maximizes ILP but keeps per-thread state
-    // live across all segments. For spawn targets with many vector params this can exceed scratch.
-    let interleave_across_sync = vector_param_count <= 8;
+    let _vector_param_count = params.iter().filter(|(_, is_vec)| *is_vec).count();
+    let interleave_across_sync = true;
     let segments = if interleave_across_sync {
         split_top_level_at_sync(&body_items)?
     } else {
         vec![body_items]
     };
     let mut local_names: HashSet<String> = HashSet::new();
-    collect_local_names_in_statement(&fn_def.node.statement.node, &mut local_names);
+    collect_local_names_in_statement(&unrolled_body, &mut local_names);
+    let thread_private_names = compute_carried_locals(&segments, &local_names);
 
     let mut out_items: Vec<Node<BlockItem>> = Vec::new();
     for (seg_i, seg) in segments.iter().enumerate() {
@@ -388,7 +387,7 @@ fn expand_spawn_call(
             let mut s = seg_stmt.clone();
             s = subst_params_in_statement(&s, &param_subst)?;
             s = subst_grid_builtins_in_statement(&s, num_threads, t as i32)?;
-            s = rename_locals_in_statement(&s, &local_names, t as i32)?;
+            s = rename_locals_in_statement(&s, &thread_private_names, t as i32)?;
             match s {
                 Statement::Compound(items) => {
                     for bi in items {
@@ -677,6 +676,203 @@ fn collect_local_names_in_statement(stmt: &Statement, acc: &mut HashSet<String>)
         Statement::Switch(sw) => collect_local_names_in_statement(&sw.node.statement.node, acc),
         _ => {}
     }
+}
+
+fn collect_declared_names_in_items(items: &[Node<BlockItem>]) -> HashSet<String> {
+    fn walk_stmt(stmt: &Statement, out: &mut HashSet<String>) {
+        match stmt {
+            Statement::Compound(items) => {
+                for item in items {
+                    match &item.node {
+                        BlockItem::Declaration(d) => {
+                            for idecl in &d.node.declarators {
+                                if let Ok(n) = declarator_name(&idecl.node.declarator) {
+                                    out.insert(n);
+                                }
+                            }
+                        }
+                        BlockItem::Statement(s) => walk_stmt(&s.node, out),
+                        BlockItem::StaticAssert(_) => {}
+                    }
+                }
+            }
+            Statement::For(f) => {
+                if let ForInitializer::Declaration(d) = &f.node.initializer.node {
+                    for idecl in &d.node.declarators {
+                        if let Ok(n) = declarator_name(&idecl.node.declarator) {
+                            out.insert(n);
+                        }
+                    }
+                }
+                walk_stmt(&f.node.statement.node, out);
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.node.then_statement.node, out);
+                if let Some(es) = &i.node.else_statement {
+                    walk_stmt(&es.node, out);
+                }
+            }
+            Statement::While(w) => walk_stmt(&w.node.statement.node, out),
+            Statement::DoWhile(d) => walk_stmt(&d.node.statement.node, out),
+            Statement::Switch(sw) => walk_stmt(&sw.node.statement.node, out),
+            _ => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    for item in items {
+        match &item.node {
+            BlockItem::Declaration(d) => {
+                for idecl in &d.node.declarators {
+                    if let Ok(n) = declarator_name(&idecl.node.declarator) {
+                        out.insert(n);
+                    }
+                }
+            }
+            BlockItem::Statement(s) => walk_stmt(&s.node, &mut out),
+            BlockItem::StaticAssert(_) => {}
+        }
+    }
+    out
+}
+
+fn collect_used_identifiers_in_items(items: &[Node<BlockItem>]) -> HashSet<String> {
+    fn walk_expr(e: &Expression, out: &mut HashSet<String>) {
+        match e {
+            Expression::Identifier(id) => {
+                out.insert(id.node.name.clone());
+            }
+            Expression::Call(c) => {
+                walk_expr(&c.node.callee.node, out);
+                for a in &c.node.arguments {
+                    walk_expr(&a.node, out);
+                }
+            }
+            Expression::BinaryOperator(b) => {
+                walk_expr(&b.node.lhs.node, out);
+                walk_expr(&b.node.rhs.node, out);
+            }
+            Expression::UnaryOperator(u) => walk_expr(&u.node.operand.node, out),
+            Expression::Cast(c) => walk_expr(&c.node.expression.node, out),
+            Expression::Conditional(c) => {
+                walk_expr(&c.node.condition.node, out);
+                walk_expr(&c.node.then_expression.node, out);
+                walk_expr(&c.node.else_expression.node, out);
+            }
+            Expression::Member(m) => walk_expr(&m.node.expression.node, out),
+            Expression::Comma(cs) => {
+                for e in cs.iter() {
+                    walk_expr(&e.node, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_stmt(stmt: &Statement, out: &mut HashSet<String>) {
+        match stmt {
+            Statement::Compound(items) => {
+                for item in items {
+                    match &item.node {
+                        BlockItem::Declaration(d) => {
+                            for idecl in &d.node.declarators {
+                                if let Some(init) = &idecl.node.initializer
+                                    && let Initializer::Expression(e) = &init.node
+                                {
+                                    walk_expr(&e.node, out);
+                                }
+                            }
+                        }
+                        BlockItem::Statement(s) => walk_stmt(&s.node, out),
+                        BlockItem::StaticAssert(_) => {}
+                    }
+                }
+            }
+            Statement::Expression(e) => {
+                if let Some(e) = e {
+                    walk_expr(&e.node, out);
+                }
+            }
+            Statement::If(i) => {
+                walk_expr(&i.node.condition.node, out);
+                walk_stmt(&i.node.then_statement.node, out);
+                if let Some(es) = &i.node.else_statement {
+                    walk_stmt(&es.node, out);
+                }
+            }
+            Statement::For(f) => {
+                match &f.node.initializer.node {
+                    ForInitializer::Expression(e) => walk_expr(&e.node, out),
+                    ForInitializer::Declaration(d) => {
+                        for idecl in &d.node.declarators {
+                            if let Some(init) = &idecl.node.initializer
+                                && let Initializer::Expression(e) = &init.node
+                            {
+                                walk_expr(&e.node, out);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(c) = &f.node.condition {
+                    walk_expr(&c.node, out);
+                }
+                if let Some(s) = &f.node.step {
+                    walk_expr(&s.node, out);
+                }
+                walk_stmt(&f.node.statement.node, out);
+            }
+            Statement::While(w) => {
+                walk_expr(&w.node.expression.node, out);
+                walk_stmt(&w.node.statement.node, out);
+            }
+            Statement::DoWhile(d) => {
+                walk_stmt(&d.node.statement.node, out);
+                walk_expr(&d.node.expression.node, out);
+            }
+            Statement::Return(e) => {
+                if let Some(e) = e {
+                    walk_expr(&e.node, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    for item in items {
+        match &item.node {
+            BlockItem::Declaration(d) => {
+                for idecl in &d.node.declarators {
+                    if let Some(init) = &idecl.node.initializer
+                        && let Initializer::Expression(e) = &init.node
+                    {
+                        walk_expr(&e.node, &mut out);
+                    }
+                }
+            }
+            BlockItem::Statement(s) => walk_stmt(&s.node, &mut out),
+            BlockItem::StaticAssert(_) => {}
+        }
+    }
+    out
+}
+
+fn compute_carried_locals(
+    segments: &[Vec<Node<BlockItem>>],
+    local_names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut carried = HashSet::new();
+    for seg in segments {
+        let declared = collect_declared_names_in_items(seg);
+        let used = collect_used_identifiers_in_items(seg);
+        for n in used {
+            if local_names.contains(&n) && !declared.contains(&n) {
+                carried.insert(n);
+            }
+        }
+    }
+    carried
 }
 
 fn try_compile_time_i32(e: &Expression) -> Option<i32> {
