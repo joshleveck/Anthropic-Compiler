@@ -198,6 +198,15 @@ pub(crate) fn build_greedy_scratch_layout(
                             );
                         }
                     }
+                    maybe_free_dead_def(
+                        dst,
+                        &remaining_uses,
+                        &mut allocs,
+                        &mut used,
+                        site,
+                        func,
+                        trace_state.as_mut(),
+                    );
                 } else {
                     for r in def_regs(inst) {
                         let fresh = ensure_allocated(
@@ -235,6 +244,15 @@ pub(crate) fn build_greedy_scratch_layout(
                                 );
                             }
                         }
+                        maybe_free_dead_def(
+                            r,
+                            &remaining_uses,
+                            &mut allocs,
+                            &mut used,
+                            site,
+                            func,
+                            trace_state.as_mut(),
+                        );
                     }
                 }
             }
@@ -295,6 +313,7 @@ pub(crate) fn build_greedy_scratch_layout(
     }
 
     let lifetime = trace_state.map(ScratchTraceState::finish);
+
     Ok((ScratchLayout { map }, lifetime))
 }
 
@@ -345,6 +364,47 @@ fn decrement_and_maybe_free(
     }
 }
 
+fn maybe_free_dead_def(
+    reg: RegisterId,
+    remaining_uses: &HashMap<RegisterId, usize>,
+    allocs: &mut HashMap<RegisterId, (usize, usize)>,
+    used: &mut [bool],
+    site: TraceSite,
+    func: &Function,
+    trace: Option<&mut ScratchTraceState>,
+) {
+    if remaining_uses.get(&reg).copied().unwrap_or(0) != 0 {
+        return;
+    }
+    if let Some((base, width)) = allocs.remove(&reg) {
+        release_range(used, base, width);
+        if let Some(t) = trace {
+            let w = width;
+            let free_step = t.step;
+            t.push_event(
+                site,
+                ScratchLifetimeEventKind::Free,
+                func,
+                reg,
+                Some(base),
+                w,
+            );
+            if let Some((alloc_bundle, alloc_step, b, w2, name)) = t.pending.remove(&reg) {
+                t.intervals.push(ScratchLifetimeInterval {
+                    reg: reg.0,
+                    reg_name: name,
+                    scratch_base: b,
+                    width: w2,
+                    alloc_bundle,
+                    free_bundle: site.bundle_index,
+                    alloc_step,
+                    free_step,
+                });
+            }
+        }
+    }
+}
+
 fn ensure_allocated(
     func: &Function,
     reg: RegisterId,
@@ -357,7 +417,7 @@ fn ensure_allocated(
         return Ok(false);
     }
     let width = reg_width(func, reg)?;
-    let Some(base) = alloc_first_fit(used, width) else {
+    let Some(base) = alloc_fit(used, width) else {
         let occupied = used.iter().filter(|x| **x).count();
         return Err(LoweringError::ScratchOverflow {
             used: occupied + width,
@@ -372,7 +432,19 @@ fn ensure_allocated(
     Ok(true)
 }
 
-fn alloc_first_fit(used: &[bool], width: usize) -> Option<usize> {
+/// Width-aware allocation to reduce fragmentation:
+/// - Vectors (width>1): low-to-high first-fit
+/// - Scalars (width=1): high-to-low first-fit
+/// This keeps contiguous low-end runs available for vec8 temporaries while scalar churn
+/// tends to occupy/disrupt high-end single slots.
+fn alloc_fit(used: &[bool], width: usize) -> Option<usize> {
+    if width <= 1 {
+        return alloc_first_fit_high(used, width).or_else(|| alloc_first_fit_low(used, width));
+    }
+    alloc_first_fit_low(used, width).or_else(|| alloc_first_fit_high(used, width))
+}
+
+fn alloc_first_fit_low(used: &[bool], width: usize) -> Option<usize> {
     if width == 0 || width > used.len() {
         return None;
     }
@@ -386,6 +458,28 @@ fn alloc_first_fit(used: &[bool], width: usize) -> Option<usize> {
             run += 1;
             if run >= width {
                 return Some(start);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
+fn alloc_first_fit_high(used: &[bool], width: usize) -> Option<usize> {
+    if width == 0 || width > used.len() {
+        return None;
+    }
+    let mut run = 0usize;
+    let mut end = 0usize;
+    for idx in (0..used.len()).rev() {
+        if !used[idx] {
+            if run == 0 {
+                end = idx;
+            }
+            run += 1;
+            if run >= width {
+                return Some(end + 1 - width);
             }
         } else {
             run = 0;

@@ -40,7 +40,7 @@ pub fn lower_translation_unit(unit: &TranslationUnit) -> Result<Program, AstLowe
     Ok(Program { functions })
 }
 
-fn lower_function_definition(
+pub fn lower_function_definition(
     def: &FunctionDefinition,
     globals: &HashMap<String, i32>,
 ) -> Result<Function, AstLoweringError> {
@@ -93,6 +93,8 @@ struct FuncLowering {
     /// Registers produced by `emit_const` / known scalars, for scalar ALU constant-folding.
     /// Matches uint32 semantics used by `problem.Machine` ALU.
     const_value: HashMap<RegisterId, i32>,
+    /// Canonical scalar constant register per value to reduce scratch pressure.
+    scalar_const_cache: HashMap<i32, RegisterId>,
     /// One scalar `const` register per immediate used by `myhash` / `vhash` (shared across all calls).
     hash_const_cache: HashMap<i32, RegisterId>,
     /// One vbroadcast'd vector per immediate used only by `vhash` — avoids re-vbroadcasting each stage/call.
@@ -109,6 +111,7 @@ impl FuncLowering {
             globals,
             zero_scalar: None,
             const_value: HashMap::new(),
+            scalar_const_cache: HashMap::new(),
             hash_const_cache: HashMap::new(),
             hash_const_vector_cache: HashMap::new(),
         }
@@ -162,8 +165,12 @@ impl FuncLowering {
     }
 
     fn emit_const(&mut self, value: i32) -> RegisterId {
+        if let Some(&r) = self.scalar_const_cache.get(&value) {
+            return r;
+        }
         let dst = self.new_temp(ValueType::Scalar);
         self.const_value.insert(dst, value);
+        self.scalar_const_cache.insert(value, dst);
         self.emit(InstrKind::Const { dst, value }, UnitClass::LoadStore);
         dst
     }

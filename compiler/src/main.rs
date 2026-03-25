@@ -29,13 +29,13 @@ fn print_usage() {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        print_usage();
-        if args.is_empty() {
-            std::process::exit(2);
-        }
-        return Ok(());
-    }
+    // if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+    //     print_usage();
+    //     if args.is_empty() {
+    //         std::process::exit(2);
+    //     }
+    //     return Ok(());
+    // }
 
     let mut advanced_scheduling = true;
     let mut trace_scratch = false;

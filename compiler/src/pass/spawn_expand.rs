@@ -42,13 +42,14 @@ fn span() -> Span {
 /// Run on the parsed translation unit (before lowering). Rewrites `kernel()` only.
 pub fn expand_spawn_in_kernel(unit: &mut TranslationUnit) -> Result<(), SpawnExpandError> {
     let fns = collect_function_definitions(unit);
+    let globals = collect_global_constants(unit);
     for ext in &mut unit.0 {
         if let ExternalDeclaration::FunctionDefinition(def) = &mut ext.node {
             let name = declarator_name(&def.node.declarator)?;
             if name != "kernel" {
                 continue;
             }
-            let new_stmt = expand_spawns_in_statement(&def.node.statement.node, &fns)?;
+            let new_stmt = expand_spawns_in_statement(&def.node.statement.node, &fns, &globals)?;
             def.node.statement = Node::new(new_stmt, def.node.statement.span);
         }
     }
@@ -69,6 +70,29 @@ fn collect_function_definitions(
     m
 }
 
+fn collect_global_constants(unit: &TranslationUnit) -> HashMap<String, i32> {
+    let mut out = HashMap::new();
+    for ext in &unit.0 {
+        if let ExternalDeclaration::Declaration(d) = &ext.node {
+            for idecl in &d.node.declarators {
+                let Ok(name) = declarator_name(&idecl.node.declarator) else {
+                    continue;
+                };
+                let Some(init) = &idecl.node.initializer else {
+                    continue;
+                };
+                let Initializer::Expression(e) = &init.node else {
+                    continue;
+                };
+                if let Some(v) = try_compile_time_i32(&e.node) {
+                    out.insert(name, v);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn declarator_name(d: &Node<Declarator>) -> Result<String, SpawnExpandError> {
     match &d.node.kind.node {
         DeclaratorKind::Identifier(id) => Ok(id.node.name.clone()),
@@ -80,6 +104,7 @@ fn declarator_name(d: &Node<Declarator>) -> Result<String, SpawnExpandError> {
 fn expand_spawns_in_statement(
     stmt: &Statement,
     fns: &HashMap<String, Node<FunctionDefinition>>,
+    globals: &HashMap<String, i32>,
 ) -> Result<Statement, SpawnExpandError> {
     match stmt {
         Statement::Compound(items) => {
@@ -87,12 +112,12 @@ fn expand_spawns_in_statement(
             for item in items {
                 match &item.node {
                     BlockItem::Statement(s) => {
-                        if let Some(blocks) = try_expand_spawn_statement(&s.node, fns)? {
+                        if let Some(blocks) = try_expand_spawn_statement(&s.node, fns, globals)? {
                             for bi in blocks {
                                 out.push(bi);
                             }
                         } else {
-                            let u = expand_spawns_in_statement(&s.node, fns)?;
+                            let u = expand_spawns_in_statement(&s.node, fns, globals)?;
                             out.push(Node::new(
                                 BlockItem::Statement(Node::new(u, s.span)),
                                 item.span,
@@ -111,13 +136,14 @@ fn expand_spawns_in_statement(
             Ok(Statement::Compound(out))
         }
         Statement::If(i) => {
-            let then_s = expand_spawns_in_statement(&i.node.then_statement.node, fns)?;
+            let then_s = expand_spawns_in_statement(&i.node.then_statement.node, fns, globals)?;
             let else_s = i
                 .node
                 .else_statement
                 .as_ref()
                 .map(|e| {
-                    expand_spawns_in_statement(&e.node, fns).map(|s| Box::new(Node::new(s, e.span)))
+                    expand_spawns_in_statement(&e.node, fns, globals)
+                        .map(|s| Box::new(Node::new(s, e.span)))
                 })
                 .transpose()?;
             Ok(Statement::If(Node::new(
@@ -130,7 +156,7 @@ fn expand_spawns_in_statement(
             )))
         }
         Statement::For(f) => {
-            let st = expand_spawns_in_statement(&f.node.statement.node, fns)?;
+            let st = expand_spawns_in_statement(&f.node.statement.node, fns, globals)?;
             Ok(Statement::For(Node::new(
                 ForStatement {
                     initializer: f.node.initializer.clone(),
@@ -277,6 +303,7 @@ fn expand_spawns_in_expr(
 fn try_expand_spawn_statement(
     stmt: &Statement,
     fns: &HashMap<String, Node<FunctionDefinition>>,
+    globals: &HashMap<String, i32>,
 ) -> Result<Option<Vec<Node<BlockItem>>>, SpawnExpandError> {
     let Statement::Expression(Some(e)) = stmt else {
         return Ok(None);
@@ -290,12 +317,13 @@ fn try_expand_spawn_statement(
     if id.node.name != "__builtin_spawn" {
         return Ok(None);
     }
-    Ok(Some(expand_spawn_call(c.as_ref(), fns)?))
+    Ok(Some(expand_spawn_call(c.as_ref(), fns, globals)?))
 }
 
 fn expand_spawn_call(
     c: &Node<CallExpression>,
     fns: &HashMap<String, Node<FunctionDefinition>>,
+    globals: &HashMap<String, i32>,
 ) -> Result<Vec<Node<BlockItem>>, SpawnExpandError> {
     let args = &c.node.arguments;
     if args.len() < 3 {
@@ -331,18 +359,23 @@ fn expand_spawn_call(
     }
 
     let mut param_subst: HashMap<String, Node<Expression>> = HashMap::new();
-    for (i, (pname, _)) in params.iter().enumerate() {
+    for (i, (pname, _is_vec)) in params.iter().enumerate() {
         param_subst.insert(pname.clone(), args[3 + i].clone());
     }
 
-    // Only body-declared names (not parameters). After `subst_params_in_statement`, uses of
-    // parameter names are replaced by call-site expressions; remaining identifiers with the same
-    // spelling refer to outer scope and must not get thread suffixes.
+    let unrolled_body = crate::pass::loop_unroll::unroll_statement(&fn_def.node.statement.node, globals);
+    let body_items = function_body_to_block_items(&unrolled_body)?;
+    let vector_param_count = params.iter().filter(|(_, is_vec)| *is_vec).count();
+    // Interleaving threads across sync-separated segments maximizes ILP but keeps per-thread state
+    // live across all segments. For spawn targets with many vector params this can exceed scratch.
+    let interleave_across_sync = vector_param_count <= 8;
+    let segments = if interleave_across_sync {
+        split_top_level_at_sync(&body_items)?
+    } else {
+        vec![body_items]
+    };
     let mut local_names: HashSet<String> = HashSet::new();
     collect_local_names_in_statement(&fn_def.node.statement.node, &mut local_names);
-
-    let body_items = function_body_to_block_items(&fn_def.node.statement.node)?;
-    let segments = split_top_level_at_sync(&body_items)?;
 
     let mut out_items: Vec<Node<BlockItem>> = Vec::new();
     for (seg_i, seg) in segments.iter().enumerate() {
@@ -374,7 +407,7 @@ fn expand_spawn_call(
             BlockItem::Statement(Node::new(for_stmt, span())),
             span(),
         ));
-        if seg_i + 1 < segments.len() {
+        if interleave_across_sync && seg_i + 1 < segments.len() {
             out_items.push(sync_expr_statement()?);
         }
     }
@@ -502,8 +535,24 @@ fn sync_expr_statement() -> Result<Node<BlockItem>, SpawnExpandError> {
 fn function_body_to_block_items(
     stmt: &Statement,
 ) -> Result<Vec<Node<BlockItem>>, SpawnExpandError> {
+    fn flatten_items(items: &[Node<BlockItem>], out: &mut Vec<Node<BlockItem>>) {
+        for item in items {
+            match &item.node {
+                BlockItem::Statement(s) => match &s.node {
+                    Statement::Compound(sub) => flatten_items(sub, out),
+                    _ => out.push(item.clone()),
+                },
+                _ => out.push(item.clone()),
+            }
+        }
+    }
+
     match stmt {
-        Statement::Compound(items) => Ok(items.clone()),
+        Statement::Compound(items) => {
+            let mut out = Vec::new();
+            flatten_items(items, &mut out);
+            Ok(out)
+        }
         _ => Ok(vec![Node::new(
             BlockItem::Statement(Node::new(stmt.clone(), span())),
             span(),
@@ -555,7 +604,7 @@ fn is_sync_expr_statement(item: &Node<BlockItem>) -> bool {
     )
 }
 
-fn function_parameters(def: &FunctionDefinition) -> Result<Vec<(String, ())>, SpawnExpandError> {
+fn function_parameters(def: &FunctionDefinition) -> Result<Vec<(String, bool)>, SpawnExpandError> {
     let decl = &def.declarator.node;
     for d in &decl.derived {
         if let DerivedDeclarator::Function(f) = &d.node {
@@ -567,7 +616,17 @@ fn function_parameters(def: &FunctionDefinition) -> Result<Vec<(String, ())>, Sp
                         return Err(err("spawn target: parameters must be named"));
                     }
                 };
-                params.push((name, ()));
+                let is_vec = p.node.specifiers.iter().any(|spec| {
+                    matches!(
+                        &spec.node,
+                        DeclarationSpecifier::TypeSpecifier(ts)
+                            if matches!(
+                                &ts.node,
+                                TypeSpecifier::TypedefName(id) if id.node.name == "vec8_t"
+                            )
+                    )
+                });
+                params.push((name, is_vec));
             }
             return Ok(params);
         }

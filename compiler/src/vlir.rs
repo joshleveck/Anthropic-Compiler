@@ -189,7 +189,7 @@ impl Function {
         &self,
         advanced_scheduling: bool,
     ) -> Result<(MachineProgram, ScratchDebugMap), LoweringError> {
-        let (p, d, _) = machine::lower_function(self, advanced_scheduling, false)?;
+        let (p, d, _) = machine::lower::lower_function(self, advanced_scheduling, false)?;
         Ok((p, d))
     }
 
@@ -198,7 +198,7 @@ impl Function {
         &self,
         advanced_scheduling: bool,
     ) -> Result<(MachineProgram, ScratchDebugMap, ScratchLifetimeTrace), LoweringError> {
-        let (p, d, t) = machine::lower_function(self, advanced_scheduling, true)?;
+        let (p, d, t) = machine::lower::lower_function(self, advanced_scheduling, true)?;
         Ok((p, d, t.unwrap()))
     }
 }

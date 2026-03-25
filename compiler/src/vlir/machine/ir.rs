@@ -55,6 +55,10 @@ pub(crate) fn has_memory_store(inst: &crate::vlir::Instruction) -> bool {
     matches!(inst.kind, InstrKind::Store(_))
 }
 
+pub(crate) fn has_memory_load(inst: &crate::vlir::Instruction) -> bool {
+    matches!(inst.kind, InstrKind::Load(_))
+}
+
 pub(crate) fn has_observable_ordering(inst: &crate::vlir::Instruction) -> bool {
     is_side_effect_instruction(inst) || matches!(inst.kind, InstrKind::Flow(_))
 }
@@ -138,6 +142,9 @@ pub(crate) fn has_dependency(
         }
         // ignore stores
         if has_memory_store(a) || has_memory_store(b) {
+            return false;
+        }
+        if has_memory_load(a) || has_memory_load(b) {
             return false;
         }
         return true;

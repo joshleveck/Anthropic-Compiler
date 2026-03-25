@@ -42,12 +42,23 @@ def compiler_exe() -> Path:
         return _COMPILER_EXE
     name = "compiler.exe" if sys.platform == "win32" else "compiler"
     exe = COMPILER_DIR / "target" / "debug" / name
-    if not exe.is_file():
-        subprocess.run(
-            ["cargo", "build", "-q"],
-            cwd=COMPILER_DIR,
-            check=True,
-        )
+    def needs_rebuild() -> bool:
+        if not exe.is_file():
+            return True
+        exe_mtime = exe.stat().st_mtime
+        candidates: list[Path] = [
+            COMPILER_DIR / "Cargo.toml",
+            COMPILER_DIR / "Cargo.lock",
+        ]
+        src_dir = COMPILER_DIR / "src"
+        if src_dir.is_dir():
+            candidates.extend([p for p in src_dir.rglob("*.rs")])
+        # Some repos may not have Cargo.lock checked in.
+        latest_src_mtime = max((p.stat().st_mtime for p in candidates if p.exists()), default=0.0)
+        return latest_src_mtime > exe_mtime
+
+    if needs_rebuild():
+        subprocess.run(["cargo", "build", "-q"], cwd=COMPILER_DIR, check=True)
     _COMPILER_EXE = exe
     return exe
 
@@ -529,6 +540,38 @@ def case_t26_compare() -> None:
         assert False
 
 
+def case_t27_vector_lcg_hash() -> None:
+    # Header layout convention matches problem.build_mem_image
+    idx_ptr = 120
+    val_ptr = 200
+    mem = [0] * 4096
+    mem[P_INP_INDICES_P] = idx_ptr
+    mem[P_INP_VALUES_P] = val_ptr
+
+    # Keep n_nodes non-power-of-two to exercise `%`.
+    n_nodes = 37
+    mem[1] = n_nodes  # p_n_nodes points at mem[1]
+
+    # Two vec8 chunks (16 elements)
+    idx0 = [u32((i * 5 + 3) % n_nodes) for i in range(VLEN * 2)]
+    val0 = [u32(0x12345678 ^ (i * 0x9E3779B1)) for i in range(VLEN * 2)]
+    mem[idx_ptr : idx_ptr + VLEN * 2] = idx0
+    mem[val_ptr : val_ptr + VLEN * 2] = val0
+
+    # Reference: mirrors t27_vector_lcg_hash.c (ROUNDS=8, val=myhash(val+idx), idx=(idx*3+1)%n_nodes)
+    ROUNDS = 8
+    idx = list(idx0)
+    val = list(val0)
+    for _ in range(ROUNDS):
+        for i in range(VLEN * 2):
+            val[i] = u32(myhash(u32(val[i] + idx[i])))
+            idx[i] = u32((idx[i] * 3 + 1) % n_nodes)
+
+    final = run_program(mem, OUT_JSON)
+    assert_mem_slice(final, idx_ptr, idx, "t27 idx")
+    assert_mem_slice(final, val_ptr, val, "t27 val")
+
+
 CASES: dict[str, Callable[[], None]] = {
     "t01_scalar_load_store": case_t01,
     "t02_vector_load_store": case_t02,
@@ -555,7 +598,8 @@ CASES: dict[str, Callable[[], None]] = {
     "t24_vector_multiply_add_add": case_t24,
     "t25_load_offset_gather": case_t25,
     "t26_spawn": case_t26,
-    "t26_spawn_compare": case_t26_compare,
+    "t27_vector_lcg_hash": case_t27_vector_lcg_hash,
+    # "t26_spawn_compare": case_t26_compare,
 }
 
 

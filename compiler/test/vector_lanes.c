@@ -38,9 +38,8 @@ const uint32_t TWO = 2;
 
 void execute_rounds(uint32_t inp_indices_p, uint32_t inp_values_p, uint32_t forest_values_p,
                     uint32_t forest_zero_value, vec8_t vforest_values_p, vec8_t vzero,
-                    vec8_t vone, vec8_t vtwo)
+                    vec8_t vone, vec8_t vtwo, vec8_t vforest_one_value, vec8_t vforest_two_value)
 {
-    /* Same offset as sample: i = 0, VLEN, 2*VLEN, … (not block_idx alone — stride 1 overlaps vloads and breaks gathers). */
     uint32_t i = (__builtin_block_dim() * __builtin_block_idx() + __builtin_thread_idx()) * VLEN;
     uint32_t idx_addr = inp_indices_p + i;
     uint32_t val_addr = inp_values_p + i;
@@ -55,10 +54,16 @@ void execute_rounds(uint32_t inp_indices_p, uint32_t inp_values_p, uint32_t fore
         uint32_t round_in_tree = h % (FOREST_HEIGHT + 1);
         uint32_t is_wrap_around_round = round_in_tree == FOREST_HEIGHT;
         uint32_t is_zero_round = round_in_tree == 0;
+        uint32_t is_one_two_round = round_in_tree == 1;
 
         if (is_zero_round)
         {
             node_val = __builtin_vbroadcast(forest_zero_value);
+        }
+        else if (is_one_two_round)
+        {
+            uint32_t idx_minus_one = idx - vone;
+            node_val = __builtin_vselect(idx_minus_one, vforest_two_value, vforest_one_value);
         }
         else
         {
@@ -78,6 +83,7 @@ void execute_rounds(uint32_t inp_indices_p, uint32_t inp_values_p, uint32_t fore
         {
             idx = vzero;
         }
+        __builtin_sync();
     }
 
     __builtin_vstore(val_addr, val);
@@ -98,11 +104,15 @@ void kernel()
     const vec8_t VFOREST_VALUES_P = __builtin_vbroadcast(forest_values_p);
 
     const uint32_t FOREST_ZERO_VALUE = __builtin_load(forest_values_p);
+    const uint32_t FOREST_ONE_VALUE = __builtin_load(forest_values_p + 1);
+    const vec8_t VFOREST_ONE_VALUE = __builtin_vbroadcast(FOREST_ONE_VALUE);
+    const uint32_t FOREST_TWO_VALUE = __builtin_load(forest_values_p + 2);
+    const vec8_t VFOREST_TWO_VALUE = __builtin_vbroadcast(FOREST_TWO_VALUE);
 
     __builtin_flow_pause();
 
-    __builtin_spawn(1, 1, execute_rounds, inp_indices_p, inp_values_p, forest_values_p, FOREST_ZERO_VALUE,
-                    VFOREST_VALUES_P, VZERO, VONE, VTWO);
+    __builtin_spawn(1, 32, execute_rounds, inp_indices_p, inp_values_p, forest_values_p, FOREST_ZERO_VALUE,
+                    VFOREST_VALUES_P, VZERO, VONE, VTWO, VFOREST_ONE_VALUE, VFOREST_TWO_VALUE);
 
     __builtin_flow_pause();
 }
